@@ -1,0 +1,40 @@
+{
+  "name": "server",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "start": "nodemon index.js",
+    "audit:mongo-storage": "node scripts/mongoStorageReport.js",
+    "cleanup:agenda-jobs": "node scripts/cleanupAgendaJobs.js",
+    "cleanup:codattempts": "node scripts/pruneCodAttemptStorage.js",
+    "qa:flow-snapshot": "node scripts/qaFlowSnapshot.js",
+    "qa:plan-flows": "node scripts/qaPlanFlows.js",
+    "qa:agent-policy": "node scripts/qaAgentReplyPolicy.js",
+    "audit:shopify-tokens": "node scripts/auditShopifyTokens.js",
+    "seed:fake-attempts": "node scripts/seedFakeAttempts.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@agendajs/mongo-backend": "^2.0.0",
+    "@shopify/shopify-api": "13.1.0",
+    "agenda": "^6.1.0",
+    "axios": "^1.13.4",
+    "bullmq": "^5.67.2",
+    "cors": "^2.8.6",
+    "countries-and-timezones": "^3.8.0",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "ioredis": "^5.9.2",
+    "libphonenumber-js": "^1.12.36",
+    "luxon": "^3.7.2",
+    "mongoose": "^9.1.5",
+    "node-fetch": "^3.3.2",
+    "nodemon": "^3.1.11",
+    "twilio": "^5.12.0"
+  }
+}
