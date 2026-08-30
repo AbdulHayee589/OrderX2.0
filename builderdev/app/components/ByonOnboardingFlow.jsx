@@ -9,7 +9,11 @@ import {
 
 import { SurfaceCard } from "./AppSurface";
 import { isMetaCallbackForActiveState } from "../utils/metaCallbackState";
-import { buildMetaEmbeddedSignupOptions } from "../utils/metaEmbeddedSignup";
+import {
+  buildMetaEmbeddedSignupOptions,
+  reserveMetaEmbeddedSignupPopup,
+  runMetaLoginInReservedPopup,
+} from "../utils/metaEmbeddedSignup";
 
 const BYON_META_CALLBACK_MESSAGE = "ORDERX_BYON_META_CALLBACK";
 const BYON_META_CALLBACK_STORAGE_KEY = "ORDERX_BYON_META_CALLBACK_PAYLOAD";
@@ -348,6 +352,7 @@ function launchMetaEmbeddedSignup({
   apiVersion,
   featureType,
   solutionId,
+  popupWindow,
   onResponse,
 }) {
   const normalizedAppId = String(appId || "").trim();
@@ -373,6 +378,7 @@ function launchMetaEmbeddedSignup({
         xfbml: false,
         cookie: true,
         autoLogAppEvents: false,
+        fedCM: false,
         version: normalizedVersion,
       });
       metaSdkInitKey = initKey;
@@ -380,14 +386,25 @@ function launchMetaEmbeddedSignup({
 
     return new Promise((resolve, reject) => {
       try {
-        FB.login((response) => {
-          try {
-            if (typeof onResponse === "function") onResponse(response);
-            resolve(response);
-          } catch (error) {
-            reject(error);
-          }
-        }, loginOptions);
+        const openLogin = () =>
+          FB.login((response) => {
+            try {
+              if (typeof onResponse === "function") onResponse(response);
+              resolve(response);
+            } catch (error) {
+              reject(error);
+            }
+          }, loginOptions);
+
+        if (popupWindow) {
+          runMetaLoginInReservedPopup({
+            browserWindow: window,
+            popupWindow,
+            openLogin,
+          });
+        } else {
+          openLogin();
+        }
       } catch (error) {
         reject(error);
       }
@@ -1053,6 +1070,19 @@ export default function ByonOnboardingFlow({
   const pendingMetaConnectStateRef = useRef("");
   const pendingMetaConnectRedirectUriRef = useRef("");
   const metaSessionPreparationRequestedRef = useRef(false);
+  const reservedMetaPopupRef = useRef(null);
+  const pendingReservedMetaLaunchRef = useRef(false);
+
+  const closeReservedMetaPopup = useCallback(() => {
+    const popup = reservedMetaPopupRef.current;
+    reservedMetaPopupRef.current = null;
+    pendingReservedMetaLaunchRef.current = false;
+    try {
+      if (popup && !popup.closed) popup.close();
+    } catch {
+      // The browser may deny access after Meta navigates the popup.
+    }
+  }, []);
 
   useEffect(() => {
     if (currentStep !== "meta") {
@@ -1097,6 +1127,7 @@ export default function ByonOnboardingFlow({
       return;
     }
     if (!data?.ok || !data?.metaConnect) {
+      closeReservedMetaPopup();
       setMetaClientError(
         String(data?.error || "Could not prepare Meta reconnect").trim(),
       );
@@ -1119,7 +1150,7 @@ export default function ByonOnboardingFlow({
     lastMetaCallbackRef.current = "";
     setPreparedMetaConnect(metaConnect);
     setMetaClientError("");
-  }, [metaConnectFetcher.data]);
+  }, [closeReservedMetaPopup, metaConnectFetcher.data]);
 
   const submitMetaFinalize = useCallback(
     (
@@ -1238,6 +1269,10 @@ export default function ByonOnboardingFlow({
       const metaConnect = toObject(connectPayload);
       if (!String(metaConnect?.state || "").trim()) return false;
 
+      const popupWindow = reservedMetaPopupRef.current;
+      reservedMetaPopupRef.current = null;
+      pendingReservedMetaLaunchRef.current = false;
+
       setMetaClientError("");
       void launchMetaEmbeddedSignup({
         appId: metaConnect.appId,
@@ -1245,6 +1280,7 @@ export default function ByonOnboardingFlow({
         apiVersion: metaConnect.apiVersion,
         featureType: metaConnect.featureType,
         solutionId: metaConnect.solutionId,
+        popupWindow,
         onResponse: (response) => {
           const code = String(response?.authResponse?.code || "").trim();
           if (code) {
@@ -1278,6 +1314,11 @@ export default function ByonOnboardingFlow({
           );
         },
       }).catch((error) => {
+        try {
+          if (popupWindow && !popupWindow.closed) popupWindow.close();
+        } catch {
+          // The window may already belong to Meta.
+        }
         setMetaClientError(
           `${error?.message || "Could not open Meta Embedded Signup"}. Click Reconnect WhatsApp Business App to retry.`,
         );
@@ -1288,13 +1329,39 @@ export default function ByonOnboardingFlow({
   );
 
   useEffect(() => {
-    if (
-      !actionData?.ok ||
-      !["byon_meta_connect_begin", "byon_meta_connect_prepare"].includes(
-        String(actionData?.intent || ""),
-      ) ||
-      !actionData?.metaConnect
-    ) {
+    if (!pendingReservedMetaLaunchRef.current) return;
+
+    const prepared = toObject(preparedMetaConnect);
+    const preparedState = String(prepared?.state || "").trim();
+    const preparedExpiresAt = new Date(prepared?.expiresAt || 0).getTime();
+    const preparedIsUsable =
+      preparedState &&
+      (!Number.isFinite(preparedExpiresAt) || preparedExpiresAt > Date.now()) &&
+      preparedState === String(pendingMetaConnectStateRef.current || "").trim();
+
+    if (preparedIsUsable) openPreparedMetaPopup(prepared);
+  }, [openPreparedMetaPopup, preparedMetaConnect]);
+
+  useEffect(
+    () => () => {
+      closeReservedMetaPopup();
+    },
+    [closeReservedMetaPopup],
+  );
+
+  useEffect(() => {
+    const actionIntent = String(actionData?.intent || "");
+    const isMetaPreparation = [
+      "byon_meta_connect_begin",
+      "byon_meta_connect_prepare",
+    ].includes(actionIntent);
+
+    if (isMetaPreparation && actionData?.ok === false) {
+      closeReservedMetaPopup();
+      return undefined;
+    }
+
+    if (!actionData?.ok || !isMetaPreparation || !actionData?.metaConnect) {
       return undefined;
     }
 
@@ -1326,7 +1393,7 @@ export default function ByonOnboardingFlow({
       openPreparedMetaPopup(metaConnect);
     }
     return undefined;
-  }, [actionData, openPreparedMetaPopup]);
+  }, [actionData, closeReservedMetaPopup, openPreparedMetaPopup]);
 
   useEffect(() => {
     if (String(actionData?.intent || "") === "byon_meta_connect_finalize") {
@@ -1546,15 +1613,37 @@ export default function ByonOnboardingFlow({
     !!preparedMetaState &&
     Number.isFinite(preparedMetaExpiresAt) &&
     preparedMetaExpiresAt > Date.now();
-  const metaConnectButtonDisabled =
-    metaConfig?.embeddedSignupEnabled === false ||
-    !metaSdkReady ||
-    metaSessionPreparing ||
+  const metaConnectButtonDisabled = metaConnectSubmitLoading;
+  const metaConnectPreparing =
     metaConnectSubmitLoading ||
-    (!metaNeedsBusinessDetails && !hasUsablePreparedMetaSession);
+    metaSessionPreparing ||
+    (!metaSdkReady && !hasUsablePreparedMetaSession);
 
   const launchWhatsAppEmbeddedSignup = () => {
     setMetaClientError("");
+
+    if (metaConfig?.embeddedSignupEnabled === false) {
+      setMetaClientError(
+        "Meta Embedded Signup is not configured for this store.",
+      );
+      return;
+    }
+
+    const existingPopup = reservedMetaPopupRef.current;
+    if (existingPopup && !existingPopup.closed) {
+      existingPopup.focus?.();
+      return;
+    }
+
+    const popupWindow = reserveMetaEmbeddedSignupPopup(window);
+    if (!popupWindow) {
+      setMetaClientError(
+        "Your browser blocked the Meta popup. Allow popups for app.orderxapp.com, then click the button again.",
+      );
+      return;
+    }
+    reservedMetaPopupRef.current = popupWindow;
+    pendingReservedMetaLaunchRef.current = true;
 
     if (metaNeedsBusinessDetails && detailsFormRef.current) {
       const fd = new FormData(detailsFormRef.current);
@@ -1578,9 +1667,10 @@ export default function ByonOnboardingFlow({
     if (preparedState) setPreparedMetaConnect(null);
 
     const fd = new FormData();
-    fd.set("intent", "byon_meta_connect_begin");
+    fd.set("intent", "byon_meta_connect_session_prepare");
     fd.set("metaFeatureType", String(metaConfig?.featureType || "").trim());
-    submit(fd, { method: "POST" });
+    metaSessionPreparationRequestedRef.current = true;
+    metaConnectFetcher.submit(fd, { method: "POST" });
   };
 
   const metaConnectButtonLabel = metaConnected
@@ -1783,11 +1873,7 @@ export default function ByonOnboardingFlow({
                 type="button"
                 onClick={launchWhatsAppEmbeddedSignup}
                 disabled={metaConnectButtonDisabled}
-                aria-busy={
-                  metaConnectSubmitLoading || metaSessionPreparing
-                    ? "true"
-                    : "false"
-                }
+                aria-busy={metaConnectPreparing ? "true" : "false"}
                 style={{
                   ...metaConnectButtonStyles,
                   cursor: metaConnectButtonDisabled ? "wait" : "pointer",
@@ -1821,11 +1907,7 @@ export default function ByonOnboardingFlow({
               type="button"
               onClick={launchWhatsAppEmbeddedSignup}
               disabled={metaConnectButtonDisabled}
-              aria-busy={
-                metaConnectSubmitLoading || metaSessionPreparing
-                  ? "true"
-                  : "false"
-              }
+              aria-busy={metaConnectPreparing ? "true" : "false"}
               style={{
                 ...metaConnectButtonStyles,
                 cursor: metaConnectButtonDisabled ? "wait" : "pointer",
