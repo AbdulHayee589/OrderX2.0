@@ -63,6 +63,24 @@ const DEFAULT_COUNTRY_MESSAGE_RATES = [
   },
 ];
 
+const COUNTRY_CODE_ALIASES = new Map([
+  ["PAK", "PK"],
+  ["PAKISTAN", "PK"],
+  ["IND", "IN"],
+  ["INDIA", "IN"],
+  ["EGY", "EG"],
+  ["EGYPT", "EG"],
+  ["SAU", "SA"],
+  ["SAUDI ARABIA", "SA"],
+  ["ARE", "AE"],
+  ["UAE", "AE"],
+  ["UNITED ARAB EMIRATES", "AE"],
+  ["MYS", "MY"],
+  ["MALAYSIA", "MY"],
+  ["IDN", "ID"],
+  ["INDONESIA", "ID"],
+]);
+
 let countryRateCache = {
   expiresAt: 0,
   map: new Map(),
@@ -74,10 +92,21 @@ function nowMs() {
   return Date.now();
 }
 
-function normalizeCountryCode(value) {
-  return String(value || "")
+export function normalizeCountryCode(value) {
+  const normalized = String(value || "")
     .trim()
     .toUpperCase();
+  return COUNTRY_CODE_ALIASES.get(normalized) || normalized;
+}
+
+export function resolveConfiguredStoreRate(
+  rateMap,
+  { explicitStoreCountryCode = "", resolvedStoreCountryCode = "" } = {},
+) {
+  const countryCode =
+    normalizeCountryCode(explicitStoreCountryCode) ||
+    normalizeCountryCode(resolvedStoreCountryCode);
+  return countryCode ? rateMap?.get(countryCode) || null : null;
 }
 
 function roundUsd(value, digits = 4) {
@@ -185,6 +214,11 @@ export function getDefaultStoreCountryCode() {
   return DEFAULT_STORE_COUNTRY_CODE || "PK";
 }
 
+export function invalidateStorePricingContextCache(shop = "") {
+  const shopDomain = String(shop || "").trim();
+  if (shopDomain) shopContextCache.delete(shopDomain);
+}
+
 export async function getCountryMessageRate(countryCode, options = {}) {
   const normalizedCountryCode = normalizeCountryCode(countryCode);
   const rateMap = await loadCountryRateMap(options);
@@ -201,9 +235,11 @@ export async function getStorePricingContext({
     normalizeCountryCode(storedContext?.storeCountryCode);
   const resolvedStoreCountryCode =
     explicitStoreCountryCode || getDefaultStoreCountryCode();
-  const matchedStoreRate = explicitStoreCountryCode
-    ? await getCountryMessageRate(explicitStoreCountryCode)
-    : null;
+  const rateMap = await loadCountryRateMap();
+  const matchedStoreRate = resolveConfiguredStoreRate(rateMap, {
+    explicitStoreCountryCode,
+    resolvedStoreCountryCode,
+  });
   const storeRate =
     matchedStoreRate ||
     normalizeRateRow({
@@ -219,7 +255,11 @@ export async function getStorePricingContext({
     growthStoreRateUsd: roundUsd(storeRate.growthPriceUsd),
     byonUtilityTemplateUsd: roundUsd(storeRate.byonUtilityTemplateUsd, 4),
     growthPricingAvailable: !!matchedStoreRate,
-    growthPricingAvailabilitySource: matchedStoreRate ? "explicit" : "fallback",
+    growthPricingAvailabilitySource: matchedStoreRate
+      ? explicitStoreCountryCode
+        ? "explicit"
+        : "configured_default"
+      : "fallback",
     requestedStoreCountryCode: explicitStoreCountryCode || null,
   };
 }

@@ -1,6 +1,9 @@
 import Shop from "../models/Shop.js";
 import { getAdminClient } from "../utils/shopifyAdmin.js";
-import { getDefaultStoreCountryCode } from "./countryPricing.js";
+import {
+  getDefaultStoreCountryCode,
+  invalidateStorePricingContextCache,
+} from "./countryPricing.js";
 
 const STORE_CONTEXT_MAX_AGE_MS = Number(
   process.env.STORE_CONTEXT_MAX_AGE_MS || 7 * 24 * 60 * 60 * 1000,
@@ -71,11 +74,15 @@ export async function maybeSyncStoreContext({
   const update = {
     storeCountryCode: storeCountryCode || getDefaultStoreCountryCode(),
     storeCountryName:
-      storeCountryName || existing?.storeCountryName || storeCountryCode || null,
+      storeCountryName ||
+      existing?.storeCountryName ||
+      storeCountryCode ||
+      null,
     storeCurrencyCode: storeCurrencyCode || existing?.storeCurrencyCode || null,
     storeContextSyncedAt: new Date(),
   };
 
   await Shop.updateOne({ shop: shopDomain }, { $set: update });
+  invalidateStorePricingContextCache(shopDomain);
   return update;
 }
