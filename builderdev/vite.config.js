@@ -37,7 +37,7 @@ if (host === "localhost") {
 
 export default defineConfig({
   server: {
-    allowedHosts: [host, "exports-peter-observe-followed.trycloudflare.com"],
+    allowedHosts: [host],
     cors: {
       preflightContinue: true,
     },

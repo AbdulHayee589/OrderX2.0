@@ -28,6 +28,60 @@ let syncBillingFromShopify;
 let originalRefreshToken;
 let originalMigrateToken;
 
+test("Mongo token storage recognizes separate databases on one deployment", async () => {
+  const { mongoUrisShareDeployment } = await import(
+    "../services/shopifyTokenService.js"
+  );
+  assert.equal(
+    mongoUrisShareDeployment(
+      "mongodb+srv://user:pass@cluster.example/orderx?retryWrites=true",
+      "mongodb+srv://user:pass@cluster.example/OrderX?retryWrites=true&w=majority",
+    ),
+    true,
+  );
+  assert.equal(
+    mongoUrisShareDeployment(
+      "mongodb+srv://user:pass@cluster-a.example/orderx",
+      "mongodb+srv://user:pass@cluster-b.example/OrderX",
+    ),
+    false,
+  );
+  assert.equal(
+    mongoUrisShareDeployment(
+      "mongodb+srv://user-a:pass@cluster.example/orderx",
+      "mongodb+srv://user-b:pass@cluster.example/OrderX",
+    ),
+    false,
+  );
+});
+
+test("a newer Shop revocation tombstone defeats a stale session mirror", async (context) => {
+  if (!mongoUri || mongoose.connection.readyState !== 1) return context.skip();
+  const shop = "revoked-tombstone.myshopify.com";
+  await persistSession(shop, {
+    accessToken: "stale-session-access",
+    refreshToken: "stale-session-refresh",
+    expires: new Date(Date.now() + 60 * 60_000),
+    refreshTokenExpires: new Date(Date.now() + 24 * 60 * 60_000),
+  });
+  await Shop.updateOne(
+    { shop },
+    {
+      $set: {
+        accessToken: null,
+        accessTokenRefreshToken: null,
+        accessTokenStatus: "revoked",
+        accessTokenUpdatedAt: new Date(Date.now() + 1000),
+      },
+    },
+  );
+
+  const snapshot = await tokenService.getShopifyTokenSnapshot(shop);
+  assert.equal(snapshot.preferred, null);
+  assert.equal(snapshot.classification.status, "revoked");
+  assert.equal(snapshot.classification.usableNow, false);
+});
+
 function getFreePort() {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
@@ -247,8 +301,18 @@ after(async () => {
   if (setAbstractFetchFunc) setAbstractFetchFunc(originalFetch);
   await mongoose.disconnect().catch(() => null);
   if (mongod) {
-    mongod.kill("SIGTERM");
-    await new Promise((resolve) => mongod.once("exit", resolve));
+    await new Promise((resolve) => {
+      if (mongod.exitCode !== null || mongod.signalCode) return resolve();
+      const forceTimer = setTimeout(() => {
+        if (mongod.exitCode === null) mongod.kill("SIGKILL");
+        resolve();
+      }, 3_000);
+      mongod.once("exit", () => {
+        clearTimeout(forceTimer);
+        resolve();
+      });
+      mongod.kill("SIGTERM");
+    });
   }
   if (dbPath) fs.rmSync(dbPath, { recursive: true, force: true });
 });

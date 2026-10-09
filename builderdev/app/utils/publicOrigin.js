@@ -22,6 +22,14 @@ function toHttpsOrigin(raw) {
   }
 }
 
+function isShopifyAdminOrigin(origin) {
+  try {
+    return new URL(origin).hostname.toLowerCase() === "admin.shopify.com";
+  } catch {
+    return false;
+  }
+}
+
 export function resolvePublicAppOrigin(requestUrlOrOrigin, envUrl = "") {
   const requestOrigin = safeOrigin(requestUrlOrOrigin);
   const normalizedRequestOrigin = toHttpsOrigin(requestOrigin);
@@ -38,3 +46,41 @@ export function resolvePublicAppOrigin(requestUrlOrOrigin, envUrl = "") {
   return normalizedRequestOrigin || requestOrigin || safeOrigin(envUrl) || "";
 }
 
+export function resolveRequestAppOrigin(request, envUrl = "") {
+  const requestUrl = (() => {
+    try {
+      return new URL(request?.url || "");
+    } catch {
+      return null;
+    }
+  })();
+  const headers = request?.headers;
+  const browserOrigin = String(headers?.get?.("origin") || "").trim();
+  const forwardedHost = String(headers?.get?.("x-forwarded-host") || "")
+    .split(",")[0]
+    .trim();
+  const forwardedProto =
+    String(headers?.get?.("x-forwarded-proto") || "")
+      .split(",")[0]
+      .trim() || "https";
+  const forwardedOrigin = forwardedHost
+    ? `${forwardedProto}://${forwardedHost}`
+    : "";
+
+  for (const candidate of [
+    forwardedOrigin,
+    requestUrl?.origin || "",
+    browserOrigin,
+  ]) {
+    const resolved = resolvePublicAppOrigin(candidate);
+    if (
+      resolved &&
+      !LOCAL_ORIGIN_RE.test(resolved) &&
+      !isShopifyAdminOrigin(resolved)
+    ) {
+      return resolved;
+    }
+  }
+
+  return resolvePublicAppOrigin(requestUrl?.origin || "", envUrl);
+}

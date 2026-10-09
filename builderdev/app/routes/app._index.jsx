@@ -28,14 +28,16 @@ import {
 } from "../components/AppSurface";
 import { backendPost } from "../server/backend.server";
 import { handleByonRouteAction } from "../server/byonActions.server";
+import { prepareShopifyOfflineSession } from "../server/shopifyOfflineSession.server";
 import { withShopParams } from "../utils/embedded";
-import { resolvePublicAppOrigin } from "../utils/publicOrigin";
+import { resolveRequestAppOrigin } from "../utils/publicOrigin";
 import {
   describePlanDetail,
   describePlanPrice,
   formatMoney,
   shouldShowPkrInfo,
 } from "../utils/billingPresentation";
+import { isShopifyBillingTestMode } from "../utils/billingMode.server";
 
 const toObject = (v) => (v && typeof v === "object" ? v : {});
 const SENDER_MODE_ORDERX = "orderx_number";
@@ -79,12 +81,12 @@ function ownSenderStatusMeta(status) {
   }
 }
 
-function resolveAppOrigin(reqUrl) {
+function resolveAppOrigin(request) {
   return (
-    resolvePublicAppOrigin(
-      reqUrl?.toString?.() || reqUrl?.origin || "",
+    resolveRequestAppOrigin(
+      request,
       process.env.SHOPIFY_APP_URL || process.env.APP_URL || "",
-    ) || reqUrl.origin
+    ) || new URL(request.url).origin
   );
 }
 
@@ -168,7 +170,25 @@ export const action = async ({ request }) => {
 
   const planKey = String(form.get("planKey") || ORDERX_FREE_PLAN_KEY);
 
-  const isTest = false;
+  const isTest = isShopifyBillingTestMode();
+
+  // Growth must be selectable as the first plan after install. Complete the
+  // backend Shop/token bootstrap before validation instead of relying on Free
+  // activation to create that state as a side effect.
+  try {
+    const requestUrl = new URL(request.url);
+    await prepareShopifyOfflineSession({
+      shop,
+      fallbackSession: session,
+      host: requestUrl.searchParams.get("host") || session.host || "",
+    });
+  } catch (e) {
+    return {
+      ok: false,
+      error: `Could not prepare Shopify billing: ${e?.message || "Failed"}`,
+      errorData: e?.data || e?.errorData || null,
+    };
+  }
 
   if (
     planKey === ORDERX_FREE_PLAN_KEY ||
@@ -212,7 +232,7 @@ export const action = async ({ request }) => {
   }
 
   const reqUrl = new URL(request.url);
-  const appOrigin = resolveAppOrigin(reqUrl);
+  const appOrigin = resolveAppOrigin(request);
   const returnUrl = new URL("/app/billing/confirm", appOrigin);
   returnUrl.searchParams.set("shop", shop);
   const host = reqUrl.searchParams.get("host") || session.host || "";
@@ -1587,9 +1607,7 @@ function PricingScreen({
 
                     <div style={{ marginTop: 12 }}>
                       <s-button
-                        href={appHref(
-                          `/app?senderMode=${SENDER_MODE_ORDERX}`,
-                        )}
+                        href={appHref(`/app?senderMode=${SENDER_MODE_ORDERX}`)}
                         variant="secondary"
                       >
                         Continue with OrderX Number
@@ -1718,8 +1736,8 @@ function PricingScreen({
             ) : null}
             {!growthPricingAvailable ? (
               <s-banner tone="warning">
-                {growthPlanBlockedReason} You can still activate OrderX Free
-                or switch to Your Own Number.
+                {growthPlanBlockedReason} You can still activate OrderX Free or
+                switch to Your Own Number.
               </s-banner>
             ) : null}
             {/* <s-section heading="Plans">

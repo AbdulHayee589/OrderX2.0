@@ -271,6 +271,10 @@ export default function PlansPage() {
     const billingResult = params.get("billing");
     if (billingResult === "success") {
       shopify.toast.show("Plan updated");
+    } else if (billingResult === "sync_failed") {
+      shopify.toast.show(
+        "Shopify approved the plan, but OrderX could not refresh it yet. Click Refresh billing.",
+      );
     } else if (billingResult === "failed") {
       shopify.toast.show("Payment not completed");
     }
@@ -927,7 +931,7 @@ export default function PlansPage() {
       <SurfaceCard soft padding="base">
         <s-stack direction="block" gap="tight">
           <s-text tone="subdued">
-            Choose your BYON package from the plan cards above in Plan &
+            Choose your BYON package from the plan cards below in Plan &
             billing.
           </s-text>
           <s-text tone="subdued">
@@ -1221,14 +1225,6 @@ export default function PlansPage() {
 
         <SectionDivider />
 
-        <s-section heading={plansHeading}>
-          {selectedSenderMode === SENDER_MODE_OWN
-            ? byonPlanSelectionContent
-            : orderxPlanSelectionContent}
-        </s-section>
-
-        <SectionDivider />
-
         {selectedSenderMode === SENDER_MODE_OWN ? (
           <>
             <s-section heading="Your Own Number setup">
@@ -1254,6 +1250,14 @@ export default function PlansPage() {
             <SectionDivider />
           </>
         ) : null}
+
+        <s-section heading={plansHeading}>
+          {selectedSenderMode === SENDER_MODE_OWN
+            ? byonPlanSelectionContent
+            : orderxPlanSelectionContent}
+        </s-section>
+
+        <SectionDivider />
 
         <s-section heading="Plan & billing">
           {billing?.hardStoppedAt ? (

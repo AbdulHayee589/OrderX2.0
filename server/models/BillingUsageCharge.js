@@ -26,7 +26,7 @@ const BillingUsageChargeSchema = new mongoose.Schema(
     capUnitsConsumed: { type: Number, default: 1 },
     billingStrategy: {
       type: String,
-      enum: ["per_message", "pakistan_threshold_batch"],
+      enum: ["per_message", "threshold_batch", "pakistan_threshold_batch"],
       default: "per_message",
       index: true,
     },

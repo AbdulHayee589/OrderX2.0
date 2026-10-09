@@ -26,24 +26,21 @@ export async function appendOrderTags(admin, orderGid, newTags = []) {
   const clean = incoming.map((t) => String(t || "").trim()).filter(Boolean);
   if (!clean.length) return;
 
-  const tags = await fetchOrderTags(admin, orderGid);
-  const next = Array.from(new Set([...(tags || []), ...clean]));
-
   const mutation = `#graphql
-    mutation($input: OrderInput!) {
-      orderUpdate(input: $input) {
-        order { id tags }
-        userErrors { message }
+    mutation AddOrderTags($id: ID!, $tags: [String!]!) {
+      tagsAdd(id: $id, tags: $tags) {
+        node { id }
+        userErrors { field message }
       }
     }
   `;
 
   const res = await admin.query({
     data: mutation,
-    variables: { input: { id: orderGid, tags: next } },
+    variables: { id: orderGid, tags: Array.from(new Set(clean)) },
   });
 
-  const errs = res.body?.data?.orderUpdate?.userErrors;
+  const errs = res.body?.data?.tagsAdd?.userErrors;
   if (errs?.length) throw new Error(errs.map((e) => e.message).join(", "));
 }
 
@@ -54,27 +51,21 @@ export async function removeOrderTags(admin, orderGid, tagsToRemove = []) {
   );
   if (!removeSet.size) return;
 
-  const currentTags = await fetchOrderTags(admin, orderGid);
-  const nextTags = (Array.isArray(currentTags) ? currentTags : []).filter(
-    (tag) => !removeSet.has(String(tag || "").trim()),
-  );
-  if (nextTags.length === (currentTags || []).length) return;
-
   const mutation = `#graphql
-    mutation($input: OrderInput!) {
-      orderUpdate(input: $input) {
-        order { id tags }
-        userErrors { message }
+    mutation RemoveOrderTags($id: ID!, $tags: [String!]!) {
+      tagsRemove(id: $id, tags: $tags) {
+        node { id }
+        userErrors { field message }
       }
     }
   `;
 
   const res = await admin.query({
     data: mutation,
-    variables: { input: { id: orderGid, tags: nextTags } },
+    variables: { id: orderGid, tags: Array.from(removeSet) },
   });
 
-  const errs = res.body?.data?.orderUpdate?.userErrors;
+  const errs = res.body?.data?.tagsRemove?.userErrors;
   if (errs?.length) throw new Error(errs.map((e) => e.message).join(", "));
 }
 

@@ -13,6 +13,10 @@ import { getPlan, PLAN_KEYS } from "./plans.js";
 import { inferCountryCodeFromE164 } from "./phone.js";
 import { getRuntimeConfig, updateRuntimeConfig } from "./runtimeConfig.js";
 import { logAudit } from "./audit.js";
+import {
+  invalidateCountryRateCache,
+  normalizeCountryCode,
+} from "./countryPricing.js";
 
 const DEFAULT_PAGE_SIZE = 25;
 const MAX_PAGE_SIZE = 100;
@@ -1260,7 +1264,7 @@ export async function listAdminCountryRates(query = {}) {
       id: safeText(item?._id),
       countryCode: safeText(item?.countryCode),
       countryName: safeText(item?.countryName),
-      growthPriceUsd: roundCurrency(item?.growthPriceUsd || 0, 3),
+      growthPriceUsd: roundCurrency(item?.growthPriceUsd || 0, 4),
       byonUtilityTemplateUsd: roundCurrency(item?.byonUtilityTemplateUsd || 0, 4),
       active: Boolean(item?.active),
       createdAt: toDate(item?.createdAt)?.toISOString() || null,
@@ -1270,20 +1274,39 @@ export async function listAdminCountryRates(query = {}) {
 }
 
 export async function saveAdminCountryRate(input = {}, actor = "admin") {
-  const countryCode = safeText(input.countryCode).toUpperCase();
+  const countryCode = normalizeCountryCode(input.countryCode);
   const countryName = safeText(input.countryName);
   if (!countryCode || !countryName) {
     throw new Error("countryCode and countryName are required");
   }
-  const growthPriceUsd = Number(input.growthPriceUsd);
-  const byonUtilityTemplateUsd = Number(input.byonUtilityTemplateUsd);
-  if (!Number.isFinite(growthPriceUsd) || growthPriceUsd < 0) {
-    throw new Error("growthPriceUsd must be a positive number");
+  if (!/^[A-Z]{2}$/.test(countryCode)) {
+    throw new Error("countryCode must be a valid two-letter country code");
   }
-  if (!Number.isFinite(byonUtilityTemplateUsd) || byonUtilityTemplateUsd < 0) {
-    throw new Error("byonUtilityTemplateUsd must be a positive number");
+  const growthPriceInput = Number(input.growthPriceUsd);
+  const byonUtilityTemplateInput = Number(input.byonUtilityTemplateUsd);
+  if (!Number.isFinite(growthPriceInput) || growthPriceInput <= 0) {
+    throw new Error("growthPriceUsd must be greater than zero");
   }
-  const active = input.active !== false;
+  if (
+    !Number.isFinite(byonUtilityTemplateInput) ||
+    byonUtilityTemplateInput < 0
+  ) {
+    throw new Error("byonUtilityTemplateUsd must be zero or greater");
+  }
+  const growthPriceUsd = roundCurrency(growthPriceInput, 4);
+  if (growthPriceUsd <= 0) {
+    throw new Error("growthPriceUsd must be at least 0.0001");
+  }
+  const byonUtilityTemplateUsd = roundCurrency(
+    byonUtilityTemplateInput,
+    4,
+  );
+  const active =
+    typeof input.active === "string"
+      ? !["false", "0", "no", "off"].includes(
+          input.active.trim().toLowerCase(),
+        )
+      : input.active !== false;
   const record = await CountryMessageRate.findOneAndUpdate(
     { countryCode },
     {
@@ -1297,6 +1320,11 @@ export async function saveAdminCountryRate(input = {}, actor = "admin") {
     },
     { upsert: true, new: true, setDefaultsOnInsert: true },
   ).lean();
+
+  // Eligibility and per-message charging both use this cache. Invalidate it
+  // only after Mongo accepts the new value so admin changes apply to the next
+  // local availability check/message instead of waiting for the TTL.
+  invalidateCountryRateCache();
 
   await logAudit({
     shop: GLOBAL_AUDIT_SCOPE,

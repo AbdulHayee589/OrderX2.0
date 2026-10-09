@@ -20,50 +20,59 @@ const DEFAULT_BYON_TEMPLATE_USD = Number(
 
 const DEFAULT_COUNTRY_MESSAGE_RATES = [
   {
-    countryCode: "PK",
-    countryName: "Pakistan",
+    countryCode: "US",
+    countryName: "United States",
     growthPriceUsd: 0.01,
     byonUtilityTemplateUsd: 0.01,
+  },
+  {
+    countryCode: "PK",
+    countryName: "Pakistan",
+    growthPriceUsd: 0.02,
+    byonUtilityTemplateUsd: 0.02,
   },
   {
     countryCode: "IN",
     countryName: "India",
     growthPriceUsd: 0.01,
-    byonUtilityTemplateUsd: 0.0014,
+    byonUtilityTemplateUsd: 0.01,
   },
   {
     countryCode: "EG",
     countryName: "Egypt",
     growthPriceUsd: 0.01,
-    byonUtilityTemplateUsd: 0.0036,
+    byonUtilityTemplateUsd: 0.01,
   },
   {
     countryCode: "SA",
     countryName: "Saudi Arabia",
     growthPriceUsd: 0.02,
-    byonUtilityTemplateUsd: 0.0107,
+    byonUtilityTemplateUsd: 0.02,
   },
   {
     countryCode: "AE",
     countryName: "United Arab Emirates",
     growthPriceUsd: 0.02,
-    byonUtilityTemplateUsd: 0.0157,
+    byonUtilityTemplateUsd: 0.02,
   },
   {
     countryCode: "MY",
     countryName: "Malaysia",
     growthPriceUsd: 0.02,
-    byonUtilityTemplateUsd: 0.014,
+    byonUtilityTemplateUsd: 0.02,
   },
   {
     countryCode: "ID",
     countryName: "Indonesia",
     growthPriceUsd: 0.03,
-    byonUtilityTemplateUsd: 0.025,
+    byonUtilityTemplateUsd: 0.03,
   },
 ];
 
 const COUNTRY_CODE_ALIASES = new Map([
+  ["USA", "US"],
+  ["UNITED STATES", "US"],
+  ["UNITED STATES OF AMERICA", "US"],
   ["PAK", "PK"],
   ["PAKISTAN", "PK"],
   ["IND", "IN"],
@@ -116,16 +125,42 @@ function roundUsd(value, digits = 4) {
 }
 
 function normalizeRateRow(row) {
+  const growthPriceUsd = Number(row?.growthPriceUsd);
+  const byonUtilityTemplateUsd = Number(row?.byonUtilityTemplateUsd);
   return {
     countryCode: normalizeCountryCode(row?.countryCode),
     countryName: String(row?.countryName || "").trim(),
-    growthPriceUsd: roundUsd(row?.growthPriceUsd || DEFAULT_GROWTH_PRICE_USD),
+    growthPriceUsd: roundUsd(
+      Number.isFinite(growthPriceUsd) && growthPriceUsd > 0
+        ? growthPriceUsd
+        : DEFAULT_GROWTH_PRICE_USD,
+    ),
     byonUtilityTemplateUsd: roundUsd(
-      row?.byonUtilityTemplateUsd || DEFAULT_BYON_TEMPLATE_USD,
+      Number.isFinite(byonUtilityTemplateUsd) && byonUtilityTemplateUsd >= 0
+        ? byonUtilityTemplateUsd
+        : DEFAULT_BYON_TEMPLATE_USD,
       4,
     ),
     active: row?.active !== false,
   };
+}
+
+export function buildActiveCountryRateMap(rows = []) {
+  const rateMap = new Map();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (row?.active === false) continue;
+    const normalized = normalizeRateRow(row);
+    if (!normalized.countryCode) continue;
+    rateMap.set(normalized.countryCode, normalized);
+  }
+  return rateMap;
+}
+
+export function calculateGrowthCapUnits(recipientRateUsd, storeRateUsd) {
+  const recipientRateUnits = Math.round(Number(recipientRateUsd || 0) * 10_000);
+  const storeRateUnits = Math.round(Number(storeRateUsd || 0) * 10_000);
+  if (recipientRateUnits <= 0 || storeRateUnits <= 0) return 1;
+  return Math.max(1, Math.ceil(recipientRateUnits / storeRateUnits));
 }
 
 async function ensureDefaultCountryMessageRates() {
@@ -140,27 +175,11 @@ async function ensureDefaultCountryMessageRates() {
   await CountryMessageRate.bulkWrite(operations, { ordered: false }).catch(
     () => {},
   );
-  await CountryMessageRate.updateOne(
-    { countryCode: "PK" },
-    {
-      $set: {
-        countryName: "Pakistan",
-        growthPriceUsd: 0.01,
-        byonUtilityTemplateUsd: 0.01,
-        active: true,
-      },
-    },
-    { upsert: true },
-  ).catch(() => {});
 }
 
 async function loadCountryRateMap(options = {}) {
   const force = options?.force === true;
-  if (
-    !force &&
-    countryRateCache.expiresAt > nowMs() &&
-    countryRateCache.map.size
-  ) {
+  if (!force && countryRateCache.expiresAt > nowMs()) {
     return countryRateCache.map;
   }
 
@@ -168,18 +187,7 @@ async function loadCountryRateMap(options = {}) {
   const rows = await CountryMessageRate.find({ active: true })
     .sort({ countryCode: 1 })
     .lean();
-  const nextMap = new Map();
-  for (const row of rows) {
-    const normalized = normalizeRateRow(row);
-    if (!normalized.countryCode) continue;
-    nextMap.set(normalized.countryCode, normalized);
-  }
-  if (!nextMap.size) {
-    for (const row of DEFAULT_COUNTRY_MESSAGE_RATES) {
-      const normalized = normalizeRateRow(row);
-      nextMap.set(normalized.countryCode, normalized);
-    }
-  }
+  const nextMap = buildActiveCountryRateMap(rows);
   countryRateCache = {
     map: nextMap,
     expiresAt: nowMs() + CACHE_TTL_MS,
@@ -219,6 +227,13 @@ export function invalidateStorePricingContextCache(shop = "") {
   if (shopDomain) shopContextCache.delete(shopDomain);
 }
 
+export function invalidateCountryRateCache() {
+  countryRateCache = {
+    expiresAt: 0,
+    map: new Map(),
+  };
+}
+
 export async function getCountryMessageRate(countryCode, options = {}) {
   const normalizedCountryCode = normalizeCountryCode(countryCode);
   const rateMap = await loadCountryRateMap(options);
@@ -228,6 +243,7 @@ export async function getCountryMessageRate(countryCode, options = {}) {
 export async function getStorePricingContext({
   shop = "",
   storeCountryCode = "",
+  forceCountryRateRefresh = false,
 } = {}) {
   const storedContext = await getStoredShopContext(shop);
   const explicitStoreCountryCode =
@@ -235,7 +251,7 @@ export async function getStorePricingContext({
     normalizeCountryCode(storedContext?.storeCountryCode);
   const resolvedStoreCountryCode =
     explicitStoreCountryCode || getDefaultStoreCountryCode();
-  const rateMap = await loadCountryRateMap();
+  const rateMap = await loadCountryRateMap({ force: forceCountryRateRefresh });
   const matchedStoreRate = resolveConfiguredStoreRate(rateMap, {
     explicitStoreCountryCode,
     resolvedStoreCountryCode,
@@ -267,10 +283,12 @@ export async function getStorePricingContext({
 export async function getGrowthPlanAvailabilityForStore({
   shop = "",
   storeCountryCode = "",
+  forceCountryRateRefresh = false,
 } = {}) {
   const pricingContext = await getStorePricingContext({
     shop,
     storeCountryCode,
+    forceCountryRateRefresh,
   });
   const countryLabel =
     pricingContext.storeCountryName ||
@@ -355,9 +373,9 @@ export async function resolveGrowthMessagePricing({
     (await getCountryMessageRate(context.recipientCountryCode)) || storeRateRow;
   const storeRateUsd = roundUsd(storeRateRow.growthPriceUsd);
   const recipientRateUsd = roundUsd(recipientRateRow.growthPriceUsd);
-  const capUnitsConsumed = Math.max(
-    1,
-    Math.ceil((recipientRateUsd + 1e-9) / Math.max(storeRateUsd, 0.0001)),
+  const capUnitsConsumed = calculateGrowthCapUnits(
+    recipientRateUsd,
+    storeRateUsd,
   );
 
   return {

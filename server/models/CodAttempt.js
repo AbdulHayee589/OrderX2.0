@@ -55,6 +55,9 @@ const CodAttemptSchema = new mongoose.Schema(
     cancelledAt: Date,
     confirmSource: String,
     cancelSource: String,
+    outcomeTagSyncedAt: { type: Date, default: null },
+    outcomeTagLastAttemptAt: { type: Date, default: null },
+    outcomeTagLastError: { type: String, default: null },
 
     stage: {
       type: String,

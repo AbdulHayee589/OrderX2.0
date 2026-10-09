@@ -8,6 +8,18 @@ import AgentAccount from "../models/AgentAccount.js";
 import AgentSession from "../models/AgentSession.js";
 import ConversationThread from "../models/ConversationThread.js";
 import WaMessageLog from "../models/WaMessageLog.js";
+import AbandonedCheckoutDispatch from "../models/AbandonedCheckoutDispatch.js";
+import AgentConversationState from "../models/AgentConversationState.js";
+import AgentSendReceipt from "../models/AgentSendReceipt.js";
+import AuditLog from "../models/AuditLog.js";
+import BillingUsageCharge from "../models/BillingUsageCharge.js";
+import CampaignRecipient from "../models/CampaignRecipient.js";
+import CampaignRun from "../models/CampaignRun.js";
+import ConversationInitiation from "../models/ConversationInitiation.js";
+import OrderUpdateDispatch from "../models/OrderUpdateDispatch.js";
+import TeamInboxLabel from "../models/TeamInboxLabel.js";
+import TeamInboxNote from "../models/TeamInboxNote.js";
+import TeamInboxQuickReply from "../models/TeamInboxQuickReply.js";
 import { agenda } from "../jobs/agenda.js";
 import { processShopifyOrderUpdateWebhook } from "../services/orderUpdates.js";
 import { maybeSyncStoreContext } from "../services/storeContext.js";
@@ -302,12 +314,16 @@ router.post("/privacy/customers-redact", async (req, res) => {
     const payload = extractPrivacyPayload(req);
     const customer = payload?.customer || {};
     const phone = normalizePhoneE164ish(customer?.phone || payload?.phone);
+    const email = String(customer?.email || payload?.email || "")
+      .trim()
+      .toLowerCase();
+    const customerId = String(customer?.id || payload?.customer_id || "").trim();
     const orderGids = buildOrderGidVariants(payload?.orders_to_redact);
 
     const or = [];
     if (phone) or.push({ phoneE164: phone });
     if (orderGids.length) or.push({ orderGid: { $in: orderGids } });
-    if (!or.length) {
+    if (!or.length && !email && !customerId) {
       return res.json({
         ok: true,
         shop,
@@ -317,41 +333,196 @@ router.post("/privacy/customers-redact", async (req, res) => {
       });
     }
 
-    const redactFilter = { shop, $or: or };
-    const attemptsResult = await CodAttempt.updateMany(redactFilter, {
-      $set: {
-        customerName: "REDACTED",
-        phoneE164: null,
-        countryCode: null,
-        timezone: null,
-      },
-    });
+    const attemptFilter = or.length ? { shop, $or: or } : { shop, _id: null };
+    const attempts = await CodAttempt.find(attemptFilter)
+      .select({ _id: 1, orderGid: 1 })
+      .lean();
+    const attemptIds = attempts.map((item) => item._id);
+    const relatedOrderGids = Array.from(
+      new Set([
+        ...orderGids,
+        ...attempts.map((item) => String(item?.orderGid || "")).filter(Boolean),
+      ]),
+    );
+    let threadKeys = phone ? [phone, phone.replace(/^\+/, "")] : [];
 
-    let blockedDeleted = 0;
-    let messagesDeleted = 0;
-    let threadsDeleted = 0;
-    if (phone) {
-      const [blockedResult, messagesResult, threadsResult] = await Promise.all([
-        BlockedContact.deleteMany({ shop, phoneE164: phone }),
-        WaMessageLog.deleteMany({ shop, toE164: phone }),
-        ConversationThread.deleteMany({
-          shop,
-          $or: [{ threadKey: phone }, { partnerE164: phone }],
-        }),
-      ]);
-      blockedDeleted = Number(blockedResult?.deletedCount || 0);
-      messagesDeleted = Number(messagesResult?.deletedCount || 0);
-      threadsDeleted = Number(threadsResult?.deletedCount || 0);
+    const messageOr = [];
+    if (attemptIds.length) messageOr.push({ attemptId: { $in: attemptIds } });
+    if (relatedOrderGids.length) {
+      messageOr.push({ orderGid: { $in: relatedOrderGids } });
     }
+    const threadOr = [];
+    if (threadKeys.length) {
+      threadOr.push(
+        { threadKey: { $in: threadKeys } },
+        { partnerE164: phone },
+      );
+    }
+    if (email) threadOr.push({ customerEmail: email });
+    if (customerId) {
+      threadOr.push(
+        { shopifyCustomerId: customerId },
+        { shopifyCustomerId: `gid://shopify/Customer/${customerId}` },
+      );
+    }
+    if (relatedOrderGids.length) {
+      threadOr.push({ lastOrderGid: { $in: relatedOrderGids } });
+    }
+    if (threadOr.length) {
+      const matchedThreads = await ConversationThread.find({
+        shop,
+        $or: threadOr,
+      })
+        .select({ threadKey: 1 })
+        .lean();
+      threadKeys = Array.from(
+        new Set([
+          ...threadKeys,
+          ...matchedThreads
+            .map((item) => String(item?.threadKey || "").trim())
+            .filter(Boolean),
+        ]),
+      );
+    }
+    if (threadKeys.length) {
+      messageOr.push({ toE164: { $in: threadKeys } });
+    }
+
+    const [
+      attemptsResult,
+      blockedResult,
+      messagesResult,
+      threadsResult,
+      campaignRecipientsResult,
+      abandonedResult,
+      updatesResult,
+      initiationsResult,
+      agentStateResult,
+      sendReceiptsResult,
+      notesResult,
+      usageChargesResult,
+      campaignClaimsResult,
+      auditsResult,
+    ] = await Promise.all([
+      CodAttempt.deleteMany({ _id: { $in: attemptIds } }),
+      threadKeys.length
+        ? BlockedContact.deleteMany({ shop, phoneE164: { $in: threadKeys } })
+        : Promise.resolve({ deletedCount: 0 }),
+      messageOr.length
+        ? WaMessageLog.deleteMany({ shop, $or: messageOr })
+        : Promise.resolve({ deletedCount: 0 }),
+      threadOr.length
+        ? ConversationThread.deleteMany({ shop, $or: threadOr })
+        : Promise.resolve({ deletedCount: 0 }),
+      threadKeys.length || relatedOrderGids.length
+        ? CampaignRecipient.deleteMany({
+            shop,
+            $or: [
+              ...(threadKeys.length
+                ? [{ toE164: { $in: threadKeys } }]
+                : []),
+              ...(relatedOrderGids.length
+                ? [{ orderGid: { $in: relatedOrderGids } }]
+                : []),
+            ],
+          })
+        : Promise.resolve({ deletedCount: 0 }),
+      threadKeys.length || email
+        ? AbandonedCheckoutDispatch.deleteMany({
+            shop,
+            $or: [
+              ...(threadKeys.length
+                ? [{ phoneE164: { $in: threadKeys } }]
+                : []),
+              ...(email ? [{ customerEmail: email }] : []),
+            ],
+          })
+        : Promise.resolve({ deletedCount: 0 }),
+      threadKeys.length || relatedOrderGids.length
+        ? OrderUpdateDispatch.deleteMany({
+            shop,
+            $or: [
+              ...(threadKeys.length
+                ? [{ phoneE164: { $in: threadKeys } }]
+                : []),
+              ...(relatedOrderGids.length
+                ? [{ orderGid: { $in: relatedOrderGids } }]
+                : []),
+            ],
+          })
+        : Promise.resolve({ deletedCount: 0 }),
+      threadKeys.length
+        ? ConversationInitiation.deleteMany({
+            shop,
+            toE164: { $in: threadKeys },
+          })
+        : Promise.resolve({ deletedCount: 0 }),
+      threadKeys.length
+        ? AgentConversationState.deleteMany({
+            shop,
+            threadKey: { $in: threadKeys },
+          })
+        : Promise.resolve({ deletedCount: 0 }),
+      threadKeys.length
+        ? AgentSendReceipt.deleteMany({ shop, threadKey: { $in: threadKeys } })
+        : Promise.resolve({ deletedCount: 0 }),
+      threadKeys.length
+        ? TeamInboxNote.deleteMany({ shop, threadKey: { $in: threadKeys } })
+        : Promise.resolve({ deletedCount: 0 }),
+      relatedOrderGids.length
+        ? BillingUsageCharge.deleteMany({
+            shop,
+            orderGid: { $in: relatedOrderGids },
+          })
+        : Promise.resolve({ deletedCount: 0 }),
+      threadKeys.length
+        ? CampaignRun.updateMany(
+            { shop },
+            {
+              $pull: {
+                recipientPhoneClaims: { phoneKey: { $in: threadKeys } },
+              },
+            },
+          )
+        : Promise.resolve({ modifiedCount: 0 }),
+      threadKeys.length || relatedOrderGids.length
+        ? AuditLog.deleteMany({
+            shop,
+            $or: [
+              ...(threadKeys.length
+                ? [
+                    { "meta.phoneE164": { $in: threadKeys } },
+                    { "meta.toE164": { $in: threadKeys } },
+                    { "meta.threadKey": { $in: threadKeys } },
+                  ]
+                : []),
+              ...(relatedOrderGids.length
+                ? [{ "meta.orderGid": { $in: relatedOrderGids } }]
+                : []),
+            ],
+          })
+        : Promise.resolve({ deletedCount: 0 }),
+    ]);
 
     return res.json({
       ok: true,
       shop,
-      attemptsMatched: Number(attemptsResult?.matchedCount || 0),
-      attemptsRedacted: Number(attemptsResult?.modifiedCount || 0),
-      blockedDeleted,
-      messagesDeleted,
-      threadsDeleted,
+      deleted: {
+        attempts: Number(attemptsResult?.deletedCount || 0),
+        blockedContacts: Number(blockedResult?.deletedCount || 0),
+        messages: Number(messagesResult?.deletedCount || 0),
+        conversationThreads: Number(threadsResult?.deletedCount || 0),
+        campaignRecipients: Number(campaignRecipientsResult?.deletedCount || 0),
+        abandonedCheckouts: Number(abandonedResult?.deletedCount || 0),
+        orderUpdates: Number(updatesResult?.deletedCount || 0),
+        conversationInitiations: Number(initiationsResult?.deletedCount || 0),
+        agentConversationStates: Number(agentStateResult?.deletedCount || 0),
+        agentSendReceipts: Number(sendReceiptsResult?.deletedCount || 0),
+        inboxNotes: Number(notesResult?.deletedCount || 0),
+        billingUsageCharges: Number(usageChargesResult?.deletedCount || 0),
+        campaignPhoneClaims: Number(campaignClaimsResult?.modifiedCount || 0),
+        auditLogs: Number(auditsResult?.deletedCount || 0),
+      },
     });
   } catch (e) {
     return res.status(500).json({ error: e?.message || "Failed" });
@@ -363,42 +534,66 @@ router.post("/privacy/shop-redact", async (req, res) => {
     const shop = String(req.query.shop || "").trim();
     if (!shop) return res.status(400).json({ error: "Missing shop" });
 
-    const [
-      attempts,
-      metrics,
-      purchases,
-      blocked,
-      messages,
-      threads,
-      agentSessions,
-      agentAccounts,
-      shopRecord,
-    ] = await Promise.all([
-        CodAttempt.deleteMany({ shop }),
-        Metric.deleteMany({ shop }),
-        PlanPurchase.deleteMany({ shop }),
-        BlockedContact.deleteMany({ shop }),
-        WaMessageLog.deleteMany({ shop }),
-        ConversationThread.deleteMany({ shop }),
-        AgentSession.deleteMany({ shop }),
-        AgentAccount.deleteMany({ shop }),
-        Shop.deleteOne({ shop }),
-      ]);
+    const [attemptRows, campaignRows] = await Promise.all([
+      CodAttempt.find({ shop }).select({ _id: 1 }).lean(),
+      CampaignRun.find({ shop }).select({ _id: 1 }).lean(),
+    ]);
+    const attemptIds = attemptRows.map((item) => String(item._id));
+    const campaignRunIds = campaignRows.map((item) => String(item._id));
+
+    // Remove the canonical Shopify session before deleting the Shop mirror.
+    await revokeShopifyTokenState(shop);
+    await agenda.cancel({
+      $or: [
+        { "data.shop": shop },
+        ...(attemptIds.length
+          ? [{ "data.attemptId": { $in: attemptIds } }]
+          : []),
+        ...(campaignRunIds.length
+          ? [{ "data.campaignRunId": { $in: campaignRunIds } }]
+          : []),
+      ],
+    });
+
+    const shopScopedModels = {
+      abandonedCheckoutDispatches: AbandonedCheckoutDispatch,
+      agentAccounts: AgentAccount,
+      agentConversationStates: AgentConversationState,
+      agentSendReceipts: AgentSendReceipt,
+      agentSessions: AgentSession,
+      attempts: CodAttempt,
+      auditLogs: AuditLog,
+      billingUsageCharges: BillingUsageCharge,
+      blockedContacts: BlockedContact,
+      campaignRecipients: CampaignRecipient,
+      campaignRuns: CampaignRun,
+      conversationInitiations: ConversationInitiation,
+      conversationThreads: ConversationThread,
+      inboxLabels: TeamInboxLabel,
+      inboxNotes: TeamInboxNote,
+      inboxQuickReplies: TeamInboxQuickReply,
+      messages: WaMessageLog,
+      metrics: Metric,
+      orderUpdateDispatches: OrderUpdateDispatch,
+      planPurchases: PlanPurchase,
+    };
+    const entries = Object.entries(shopScopedModels);
+    const results = await Promise.all(
+      entries.map(([, Model]) => Model.deleteMany({ shop })),
+    );
+    const deleted = Object.fromEntries(
+      entries.map(([key], index) => [
+        key,
+        Number(results[index]?.deletedCount || 0),
+      ]),
+    );
+    const shopRecord = await Shop.deleteOne({ shop });
+    deleted.shops = Number(shopRecord?.deletedCount || 0);
 
     return res.json({
       ok: true,
       shop,
-      deleted: {
-        attempts: Number(attempts?.deletedCount || 0),
-        metrics: Number(metrics?.deletedCount || 0),
-        purchases: Number(purchases?.deletedCount || 0),
-        blockedContacts: Number(blocked?.deletedCount || 0),
-        messages: Number(messages?.deletedCount || 0),
-        conversationThreads: Number(threads?.deletedCount || 0),
-        agentSessions: Number(agentSessions?.deletedCount || 0),
-        agentAccounts: Number(agentAccounts?.deletedCount || 0),
-        shops: Number(shopRecord?.deletedCount || 0),
-      },
+      deleted,
     });
   } catch (e) {
     return res.status(500).json({ error: e?.message || "Failed" });

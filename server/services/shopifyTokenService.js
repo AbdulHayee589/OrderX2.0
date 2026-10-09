@@ -40,27 +40,32 @@ const SESSION_COLLECTION =
 const LOCK_COLLECTION =
   asText(process.env.SHOPIFY_TOKEN_LOCK_COLLECTION) || "shopifyTokenLocks";
 const SESSION_MONGO_URI =
-  asText(process.env.SHOPIFY_SESSION_MONGO_URI) || asText(process.env.MONGO_URI);
+  asText(process.env.SHOPIFY_SESSION_MONGO_URI) ||
+  asText(process.env.MONGO_URI);
 const SESSION_MONGO_DB =
   asText(process.env.SHOPIFY_SESSION_MONGO_DB) ||
   deriveDatabaseName(SESSION_MONGO_URI);
 const AUTO_MIGRATION_ENABLED =
-  asText(process.env.SHOPIFY_OFFLINE_TOKEN_AUTO_MIGRATION_ENABLED).toLowerCase() ===
-  "true";
+  asText(
+    process.env.SHOPIFY_OFFLINE_TOKEN_AUTO_MIGRATION_ENABLED,
+  ).toLowerCase() === "true";
 const MIGRATION_CANARY_SHOPS = new Set(
   asText(process.env.SHOPIFY_OFFLINE_TOKEN_MIGRATION_CANARY_SHOPS)
     .split(",")
     .map((shop) => normalizeShop(shop))
     .filter(Boolean),
 );
-const ALLOW_NON_TRANSACTIONAL_DEV_STORAGE = (() => {
+const ALLOW_NON_TRANSACTIONAL_TOKEN_STORAGE = (() => {
   const configured = asText(
     process.env.SHOPIFY_TOKEN_ALLOW_NON_TRANSACTIONAL_DEV_STORAGE,
   ).toLowerCase();
   if (configured) {
     return ["1", "true", "yes"].includes(configured);
   }
-  return asText(process.env.NODE_ENV).toLowerCase() !== "production";
+  const requireTransactions = asText(
+    process.env.SHOPIFY_TOKEN_REQUIRE_TRANSACTIONS,
+  ).toLowerCase();
+  return !["1", "true", "yes"].includes(requireTransactions);
 })();
 
 const localShopTokenMutex = createKeyedMutex();
@@ -100,8 +105,10 @@ function deriveDatabaseName(uri) {
   if (!uri) return "OrderX";
   try {
     const parsed = new URL(uri);
-    return decodeURIComponent(String(parsed.pathname || "").replace(/^\/+/, "")) ||
-      "OrderX";
+    return (
+      decodeURIComponent(String(parsed.pathname || "").replace(/^\/+/, "")) ||
+      "OrderX"
+    );
   } catch {
     return "OrderX";
   }
@@ -113,8 +120,7 @@ function sleep(ms) {
 
 export function mongoHelloSupportsTransactions(hello = {}) {
   return (
-    Boolean(hello?.setName) ||
-    asText(hello?.msg).toLowerCase() === "isdbgrid"
+    Boolean(hello?.setName) || asText(hello?.msg).toLowerCase() === "isdbgrid"
   );
 }
 
@@ -139,7 +145,7 @@ async function runTokenStorageWrite(sessionStore, operationName, work) {
     sessionStore.client,
   );
   if (!supportsTransactions) {
-    if (!ALLOW_NON_TRANSACTIONAL_DEV_STORAGE) {
+    if (!ALLOW_NON_TRANSACTIONAL_TOKEN_STORAGE) {
       const error = new Error(
         "MongoDB transactions require a replica set or mongos for Shopify token storage.",
       );
@@ -149,7 +155,7 @@ async function runTokenStorageWrite(sessionStore, operationName, work) {
     if (!warnedAboutStandaloneTokenStorage) {
       warnedAboutStandaloneTokenStorage = true;
       console.warn(
-        "[shopify_tokens] Standalone MongoDB detected; using the development-only token storage fallback. Use a replica set in production.",
+        "[shopify_tokens] Standalone MongoDB detected; using versioned complete-pair token mirroring. Use a replica set for transactional token storage.",
       );
     }
     return work(null);
@@ -277,7 +283,8 @@ function sessionDocumentFromBundle(bundle, { version, now }) {
     expiresAt: bundle.accessTokenExpiresAt || null,
     payload: session.toPropertyArray(true),
     tokenStatus:
-      classifyTokenBundle(bundle, { now }).status || SHOPIFY_TOKEN_STATUS.UNKNOWN,
+      classifyTokenBundle(bundle, { now }).status ||
+      SHOPIFY_TOKEN_STATUS.UNKNOWN,
     tokenVersion: version,
     updatedAt: now,
   };
@@ -290,9 +297,46 @@ function primaryMongoClient() {
   return mongoose.connection.getClient();
 }
 
+function mongoDeploymentIdentity(value) {
+  const uri = asText(value);
+  const schemeEnd = uri.indexOf("://");
+  if (schemeEnd <= 0) return null;
+
+  const scheme = uri.slice(0, schemeEnd).toLowerCase();
+  if (scheme !== "mongodb" && scheme !== "mongodb+srv") return null;
+
+  const remainder = uri.slice(schemeEnd + 3);
+  const authorityEnd = remainder.search(/[/?]/);
+  const authority =
+    authorityEnd >= 0 ? remainder.slice(0, authorityEnd) : remainder;
+  const credentialEnd = authority.lastIndexOf("@");
+  const credentials =
+    credentialEnd >= 0 ? authority.slice(0, credentialEnd) : "";
+  const hosts = (
+    credentialEnd >= 0 ? authority.slice(credentialEnd + 1) : authority
+  )
+    .split(",")
+    .map((host) => host.trim().toLowerCase())
+    .filter(Boolean)
+    .sort();
+  if (!hosts.length) return null;
+
+  return JSON.stringify({ scheme, credentials, hosts });
+}
+
+export function mongoUrisShareDeployment(left, right) {
+  const leftIdentity = mongoDeploymentIdentity(left);
+  const rightIdentity = mongoDeploymentIdentity(right);
+  return !!leftIdentity && leftIdentity === rightIdentity;
+}
+
 function sharesPrimaryMongoClient() {
   const mainUri = asText(process.env.MONGO_URI);
-  return !process.env.SHOPIFY_SESSION_MONGO_URI || SESSION_MONGO_URI === mainUri;
+  return (
+    !process.env.SHOPIFY_SESSION_MONGO_URI ||
+    SESSION_MONGO_URI === mainUri ||
+    mongoUrisShareDeployment(SESSION_MONGO_URI, mainUri)
+  );
 }
 
 async function getSessionStore() {
@@ -386,20 +430,23 @@ async function withDistributedShopTokenLock(shop, work, options = {}) {
   const key = normalizeShop(shop);
   return localShopTokenMutex.run(key, async () => {
     const lock = await acquireDistributedLock(key, options);
-    const heartbeat = setInterval(() => {
-      const now = new Date();
-      void lock.collection
-        .updateOne(
-          { _id: key, owner: lock.owner },
-          {
-            $set: {
-              leaseUntil: new Date(now.getTime() + LOCK_LEASE_MS),
-              updatedAt: now,
+    const heartbeat = setInterval(
+      () => {
+        const now = new Date();
+        void lock.collection
+          .updateOne(
+            { _id: key, owner: lock.owner },
+            {
+              $set: {
+                leaseUntil: new Date(now.getTime() + LOCK_LEASE_MS),
+                updatedAt: now,
+              },
             },
-          },
-        )
-        .catch(() => null);
-    }, Math.max(5_000, Math.floor(LOCK_LEASE_MS / 3)));
+          )
+          .catch(() => null);
+      },
+      Math.max(5_000, Math.floor(LOCK_LEASE_MS / 3)),
+    );
     heartbeat.unref?.();
     try {
       return await work();
@@ -412,7 +459,11 @@ async function withDistributedShopTokenLock(shop, work, options = {}) {
   });
 }
 
-async function readShopRecord(shop, providedRecord = null, mongoSession = null) {
+async function readShopRecord(
+  shop,
+  providedRecord = null,
+  mongoSession = null,
+) {
   if (providedRecord?.shop === shop && providedRecord?.accessTokenUpdatedAt) {
     return providedRecord;
   }
@@ -462,28 +513,44 @@ export async function getShopifyTokenSnapshot(
       })
     : null;
   const storedCandidates = [shopBundle, sessionBundle].filter(Boolean);
-  const preferred =
+  let preferred =
     selectPreferredTokenBundle(storedCandidates, {
       bufferMs: ACCESS_TOKEN_EXPIRY_BUFFER_MS,
     }) ||
     selectPreferredTokenBundle([fallbackBundle].filter(Boolean), {
       bufferMs: ACCESS_TOKEN_EXPIRY_BUFFER_MS,
     });
-  let classification = classifyTokenBundle(
-    preferred || { shop: shopDomain },
-    {
-      bufferMs: ACCESS_TOKEN_EXPIRY_BUFFER_MS,
-    },
+  const revokedAt = toValidDate(shopRecord?.accessTokenUpdatedAt);
+  const sessionUpdatedAt = toValidDate(sessionDocument?.updatedAt);
+  const revokedStateIsNewest = Boolean(
+    shopRecord?.accessTokenStatus === SHOPIFY_TOKEN_STATUS.REVOKED &&
+    revokedAt &&
+    (!sessionUpdatedAt || revokedAt >= sessionUpdatedAt),
   );
+  if (revokedStateIsNewest) preferred = null;
+  let classification = classifyTokenBundle(preferred || { shop: shopDomain }, {
+    bufferMs: ACCESS_TOKEN_EXPIRY_BUFFER_MS,
+  });
+  if (revokedStateIsNewest) {
+    classification = {
+      ...classification,
+      kind: "revoked",
+      status: SHOPIFY_TOKEN_STATUS.REVOKED,
+      usableNow: false,
+      automaticallyRepairable: false,
+      requiresReauthorization: true,
+      reason: "shop_uninstalled_or_token_revoked",
+    };
+  }
   const rejectedAt = toValidDate(shopRecord?.accessTokenLastErrorAt);
   const preferredUpdatedAt = toValidDate(preferred?.updatedAt);
   const rejectedCurrentToken = Boolean(
     preferred?.accessToken &&
-      shopRecord?.accessTokenStatus ===
-        SHOPIFY_TOKEN_STATUS.REAUTHORIZATION_REQUIRED &&
-      sameToken(preferred.accessToken, shopBundle?.accessToken) &&
-      rejectedAt &&
-      (!preferredUpdatedAt || preferredUpdatedAt <= rejectedAt),
+    shopRecord?.accessTokenStatus ===
+      SHOPIFY_TOKEN_STATUS.REAUTHORIZATION_REQUIRED &&
+    sameToken(preferred.accessToken, shopBundle?.accessToken) &&
+    rejectedAt &&
+    (!preferredUpdatedAt || preferredUpdatedAt <= rejectedAt),
   );
   if (rejectedCurrentToken) {
     classification = {
@@ -498,10 +565,10 @@ export async function getShopifyTokenSnapshot(
   }
   const mirrorOutOfSync = Boolean(
     preferred &&
-      (!shopBundle ||
-        !sessionBundle ||
-        !sameCredentialBundle(preferred, shopBundle) ||
-        !sameCredentialBundle(preferred, sessionBundle)),
+    (!shopBundle ||
+      !sessionBundle ||
+      !sameCredentialBundle(preferred, shopBundle) ||
+      !sameCredentialBundle(preferred, sessionBundle)),
   );
   return {
     shop: shopDomain,
@@ -908,10 +975,7 @@ function resolveReadOnlyTokenFastPath(snapshot, shopDomain, options = {}) {
   return null;
 }
 
-export async function ensureValidShopOfflineAccessToken(
-  shop,
-  options = {},
-) {
+export async function ensureValidShopOfflineAccessToken(shop, options = {}) {
   const shopDomain = normalizeShop(shop);
   if (!shopDomain) throw new Error("Missing shop");
 
@@ -1060,7 +1124,8 @@ export async function ensureValidShopOfflineAccessToken(
           if (snapshot.preferred) {
             return {
               ...snapshot.preferred,
-              migrated: classifyTokenBundle(snapshot.preferred).kind === "expiring",
+              migrated:
+                classifyTokenBundle(snapshot.preferred).kind === "expiring",
               refreshed: false,
               recoveredFromNewerToken: true,
             };
@@ -1144,7 +1209,9 @@ export async function persistOfflineSessionToShop({
       [snapshot.preferred, incoming].filter(Boolean),
     );
     if (!preferred || !isCompleteTokenBundle(preferred)) {
-      throw new Error("Cannot synchronize an incomplete Shopify offline token.");
+      throw new Error(
+        "Cannot synchronize an incomplete Shopify offline token.",
+      );
     }
     return persistTokenBundleAtomic(preferred, {
       host,
@@ -1261,8 +1328,7 @@ export function classifyShopifyTokenAudit(snapshot, options = {}) {
   if (state.requiresReauthorization) category = "reauthorization_required";
   else if (state.kind === "partial" && !state.automaticallyRepairable) {
     category = "broken_partial_migration";
-  }
-  else if (
+  } else if (
     state.automaticallyRepairable ||
     state.kind === "legacy" ||
     snapshot?.mirrorOutOfSync
@@ -1292,7 +1358,9 @@ export async function auditShopifyTokens({ shops = [], limit = 500 } = {}) {
       ? Math.floor(parsedLimit)
       : 500;
   const sessionStore = await getSessionStore();
-  const query = normalizedShops.length ? { shop: { $in: normalizedShops } } : {};
+  const query = normalizedShops.length
+    ? { shop: { $in: normalizedShops } }
+    : {};
   const [rows, sessionRows] = await Promise.all([
     Shop.find(query)
       .select({ shop: 1 })
@@ -1303,9 +1371,7 @@ export async function auditShopifyTokens({ shops = [], limit = 500 } = {}) {
       .find(
         {
           isOnline: { $ne: true },
-          ...(normalizedShops.length
-            ? { shop: { $in: normalizedShops } }
-            : {}),
+          ...(normalizedShops.length ? { shop: { $in: normalizedShops } } : {}),
         },
         { projection: { shop: 1, payload: 1 } },
       )
@@ -1319,9 +1385,7 @@ export async function auditShopifyTokens({ shops = [], limit = 500 } = {}) {
         ...normalizedShops,
         ...rows.map((row) => normalizeShop(row?.shop)),
         ...sessionRows.map((row) =>
-          normalizeShop(
-            row?.shop || tokenBundleFromSessionDocument(row)?.shop,
-          ),
+          normalizeShop(row?.shop || tokenBundleFromSessionDocument(row)?.shop),
         ),
       ].filter(Boolean),
     ),

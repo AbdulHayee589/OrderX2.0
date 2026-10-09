@@ -10,15 +10,14 @@ const envPaths = [
   path.resolve(__dirname, "../../server/.env"),
 ];
 
-const reloadLocalEnv = process.env.NODE_ENV !== "production";
-
-if (!globalThis.__orderxBuilderEnvLoaded || reloadLocalEnv) {
-  for (const [index, envPath] of envPaths.entries()) {
+if (!globalThis.__orderxBuilderEnvLoaded) {
+  for (const envPath of envPaths) {
     dotenv.config({
       path: envPath,
-      // During app dev, make edits to builderdev/.env effective after an HMR
-      // reload. Never override platform-provided environment values in prod.
-      override: reloadLocalEnv && index === 0,
+      // Shopify CLI injects the current tunnel into SHOPIFY_APP_URL. Never let
+      // a checked/local .env value replace that runtime URL, or billing returns
+      // to the production hostname instead of the active development preview.
+      override: false,
     });
   }
   globalThis.__orderxBuilderEnvLoaded = true;

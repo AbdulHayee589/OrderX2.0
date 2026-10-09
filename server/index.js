@@ -25,6 +25,7 @@ import waLinksRoutes from "./routes/waLinks.js";
 import agentRoutes from "./routes/agents.js";
 
 import { startAgenda } from "./jobs/definitions.js";
+import { agenda } from "./jobs/agenda.js";
 import { ensureAgentIndexes } from "./services/agentAuth.js";
 import "./jobs/definitions.js";
 
@@ -50,9 +51,12 @@ app.disable("x-powered-by");
 // Helpful when deployed behind Render/NGINX/Cloudflare etc.
 app.set("trust proxy", 1);
 
-const { warnings } = validateSecurityConfig();
+const { warnings, errors } = validateSecurityConfig();
 for (const warning of warnings) {
   console.warn(`[security] ${warning}`);
+}
+if (errors.length) {
+  throw new Error(`Invalid production configuration: ${errors.join(" ")}`);
 }
 
 // Optional: enforce HTTPS for WhatsApp button links
@@ -209,6 +213,17 @@ app.use("/debug", internalLimiter, internalAuth, debugRoutes);
 // Order detection is polling-based (Agenda job: poll_cod_orders).
 
 app.use("/whatsapp", publicWebhookLimiter, waRoutes);
+app.get("/healthz", (_req, res) => {
+  const mongoReady = mongoose.connection.readyState === 1;
+  return res
+    .status(mongoReady ? 200 : 503)
+    .set({
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "X-Robots-Tag": "noindex, nofollow",
+    })
+    .json({ ok: mongoReady });
+});
 app.get("/", (_req, res) => res.send("OrderX backend online"));
 
 app.use((req, res) => {
@@ -225,6 +240,38 @@ app.use((err, _req, res, _next) => {
 
 await startAgenda();
 
-app.listen(process.env.PORT || 8081, () => {
-  console.log(`Server running on :${process.env.PORT || 8081}`);
+const port = envNumber("PORT", 8081);
+const server = app.listen(port, () => {
+  console.log(`Server running on :${port}`);
 });
+
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[server_shutdown] ${signal} received; draining connections`);
+
+  const forceClose = setTimeout(() => {
+    console.error("[server_shutdown] timed out; forcing exit");
+    server.closeAllConnections?.();
+    process.exit(1);
+  }, envNumber("APP_SHUTDOWN_TIMEOUT_MS", 15_000));
+  forceClose.unref?.();
+
+  try {
+    await new Promise((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
+    await agenda.stop();
+    await mongoose.disconnect();
+    clearTimeout(forceClose);
+    process.exit(0);
+  } catch (error) {
+    console.error("[server_shutdown] failed", error?.message || error);
+    clearTimeout(forceClose);
+    process.exit(1);
+  }
+}
+
+process.once("SIGTERM", () => void shutdown("SIGTERM"));
+process.once("SIGINT", () => void shutdown("SIGINT"));

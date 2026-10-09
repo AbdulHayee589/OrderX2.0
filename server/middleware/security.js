@@ -159,19 +159,78 @@ export function rejectSuspiciousPayload(req, res, next) {
 
 export function validateSecurityConfig() {
   const warnings = [];
+  const errors = [];
   const isProd =
     String(process.env.NODE_ENV || "").toLowerCase() === "production";
 
   if (isProd && !process.env.INTERNAL_SYNC_SECRET) {
-    warnings.push(
-      "INTERNAL_SYNC_SECRET is missing; internal endpoints must not run without it.",
+    errors.push(
+      "INTERNAL_SYNC_SECRET is required for frontend-to-backend requests.",
     );
   }
 
-  if (isProd && !process.env.WA_TOKEN_SECRET) {
-    warnings.push(
-      "WA_TOKEN_SECRET is missing; WhatsApp webhook signature verification cannot be strict.",
+  if (
+    isProd &&
+    !process.env.WA_APP_SECRET &&
+    !process.env.WA_SECRET
+  ) {
+    errors.push(
+      "WA_APP_SECRET or WA_SECRET is required for WhatsApp webhook verification.",
     );
+  }
+
+  if (
+    isProd &&
+    !process.env.WA_TOKEN_SECRET &&
+    !process.env.INTERNAL_SYNC_SECRET
+  ) {
+    errors.push(
+      "WA_TOKEN_SECRET or INTERNAL_SYNC_SECRET is missing; WhatsApp action links cannot be signed.",
+    );
+  }
+
+  if (isProd) {
+    const required = [
+      "SHOPIFY_API_KEY",
+      "SHOPIFY_API_SECRET",
+      "APP_URL",
+      "WA_PHONE_NUMBER_ID",
+      "WA_ACCESS_TOKEN",
+      "WA_VERIFY_TOKEN",
+      "META_APP_ID",
+      "META_APP_SECRET",
+      "META_EMBEDDED_SIGNUP_CONFIG_ID",
+    ];
+    for (const name of required) {
+      if (!String(process.env[name] || "").trim()) {
+        errors.push(`${name} is required in production.`);
+      }
+    }
+
+    if (process.env.ALLOW_UNAUTH_INTERNAL === "true") {
+      errors.push("ALLOW_UNAUTH_INTERNAL must not be enabled in production.");
+    }
+    if (process.env.ALLOW_UNSIGNED_WA_WEBHOOK === "true") {
+      errors.push("ALLOW_UNSIGNED_WA_WEBHOOK must not be enabled in production.");
+    }
+
+    if (process.env.ADMIN_PASSWORD || process.env.ADMIN_SECOND_FACTOR) {
+      warnings.push(
+        "Use salted ADMIN_PASSWORD_HASH and ADMIN_SECOND_FACTOR_HASH values instead of plaintext admin credentials.",
+      );
+    }
+
+    for (const name of ["APP_URL", "SHOPIFY_APP_URL"]) {
+      const value = String(process.env[name] || "").trim();
+      if (!value) continue;
+      try {
+        if (new URL(value).protocol !== "https:") {
+          errors.push(`${name} must use HTTPS in production.`);
+        }
+      } catch {
+        errors.push(`${name} must be a valid absolute URL.`);
+      }
+    }
   }
 
   const mongoUri = String(process.env.MONGO_URI || "");
@@ -181,7 +240,7 @@ export function validateSecurityConfig() {
     );
   }
 
-  return { warnings };
+  return { warnings, errors };
 }
 
 export function jsonBodyLimit() {

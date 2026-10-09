@@ -4,6 +4,7 @@ import {
   shopifyWebhookError,
   verifyShopifyWebhook,
 } from "../server/shopifyWebhook.server";
+import { normalizeComplianceTopic } from "../utils/complianceWebhook";
 
 export const action = async ({ request }) => {
   let webhook;
@@ -14,20 +15,21 @@ export const action = async ({ request }) => {
   }
 
   const { shop, topic, payload } = webhook;
+  const normalizedTopic = normalizeComplianceTopic(topic);
   console.log(`Received ${topic} webhook for ${shop}`);
 
   try {
-    if (topic === "CUSTOMERS_DATA_REQUEST") {
+    if (normalizedTopic === "CUSTOMERS_DATA_REQUEST") {
       await backendPost("/internal/privacy/customers-data-request", shop, {
         topic,
         payload,
       });
-    } else if (topic === "CUSTOMERS_REDACT") {
+    } else if (normalizedTopic === "CUSTOMERS_REDACT") {
       await backendPost("/internal/privacy/customers-redact", shop, {
         topic,
         payload,
       });
-    } else if (topic === "SHOP_REDACT") {
+    } else if (normalizedTopic === "SHOP_REDACT") {
       await backendPost("/internal/privacy/shop-redact", shop, {
         topic,
         payload,
@@ -40,7 +42,11 @@ export const action = async ({ request }) => {
       topic,
       error?.message || error,
     );
-    // Keep webhook ack successful.
+    // A failure response lets Shopify retry instead of silently losing a
+    // legally required data-access or deletion request.
+    return new Response("Compliance webhook processing failed", {
+      status: 500,
+    });
   }
 
   return shopifyWebhookAck();

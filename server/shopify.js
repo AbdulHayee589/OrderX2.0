@@ -27,6 +27,6 @@ export const shopify = shopifyApi({
   apiSecretKey,
   scopes,
   hostName: appUrl.replace("https://", "").replace(/\/$/, ""),
-  apiVersion: ApiVersion.October25,
+  apiVersion: ApiVersion.July26,
   isEmbeddedApp: true,
 });

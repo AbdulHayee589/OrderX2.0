@@ -3,12 +3,14 @@ import Shop from "../models/Shop.js";
 import Metric from "../models/Metric.js";
 import {
   getAdminClient,
-  appendOrderTag,
+  appendOrderTags,
   applyRequestedChangesToOrder,
   removeOrderTags,
 } from "../services/shopifyAdmin.js";
 
 const CONFIRMATION_SENT_TAG = "CONFIRMATION_SENT📩";
+const ORDER_CONFIRMED_TAG = "ORDER_CONFIRMED✅";
+const ORDER_CANCELLED_TAG = "ORDER_CANCELLED❌";
 
 async function loadShopRecord(shop) {
   const record = await Shop.findOne({ shop }).lean();
@@ -34,6 +36,87 @@ async function recordSavedOrder(shop, amount) {
   await Metric.updateOne({ shop, day: today }, { $inc: inc }, { upsert: true });
 }
 
+function outcomeTagsForAttempt(attempt) {
+  if (String(attempt?.status || "").trim() === "confirmed") {
+    return attempt?.stage === "post_failed_delivery"
+      ? [ORDER_CONFIRMED_TAG, "cod_redeliver"]
+      : [ORDER_CONFIRMED_TAG];
+  }
+  if (String(attempt?.status || "").trim() === "cancelled") {
+    return [ORDER_CANCELLED_TAG];
+  }
+  return [];
+}
+
+export async function syncAttemptOutcomeTags(
+  attemptOrId,
+  { shopRecord = null, admin = null, throwOnError = false } = {},
+) {
+  const attempt =
+    attemptOrId && typeof attemptOrId === "object"
+      ? attemptOrId
+      : await CodAttempt.findById(attemptOrId).lean();
+  if (!attempt?._id) return { ok: false, skipped: "attempt_not_found" };
+
+  const tags = outcomeTagsForAttempt(attempt);
+  if (!tags.length || !attempt.orderGid) {
+    return { ok: false, skipped: "outcome_not_tag_eligible" };
+  }
+
+  const attemptedAt = new Date();
+  try {
+    const resolvedShopRecord = shopRecord || (await loadShopRecord(attempt.shop));
+    const resolvedAdmin =
+      admin ||
+      (await getAdminClient(attempt.shop, {
+        accessToken: resolvedShopRecord.accessToken || "",
+        record: resolvedShopRecord,
+      }));
+
+    // Shopify's tagsAdd/tagsRemove mutations are idempotent and do not replace
+    // unrelated merchant tags. This also makes retries safe after a transient
+    // Admin API/token failure.
+    await appendOrderTags(resolvedAdmin, attempt.orderGid, tags);
+    await removeOrderTags(resolvedAdmin, attempt.orderGid, [
+      CONFIRMATION_SENT_TAG,
+    ]);
+    await CodAttempt.updateOne(
+      { _id: attempt._id },
+      {
+        $set: {
+          outcomeTagSyncedAt: new Date(),
+          outcomeTagLastAttemptAt: attemptedAt,
+          outcomeTagLastError: null,
+        },
+      },
+    );
+    return { ok: true, tags };
+  } catch (error) {
+    const message = String(error?.message || error || "Tag sync failed").slice(
+      0,
+      500,
+    );
+    await CodAttempt.updateOne(
+      { _id: attempt._id },
+      {
+        $set: {
+          outcomeTagLastAttemptAt: attemptedAt,
+          outcomeTagLastError: message,
+        },
+      },
+    ).catch(() => null);
+    console.error("[attempt_outcome_tag_sync]", {
+      shop: attempt.shop,
+      orderGid: attempt.orderGid,
+      attemptId: attempt._id?.toString?.() || String(attempt._id),
+      status: attempt.status,
+      message,
+    });
+    if (throwOnError) throw error;
+    return { ok: false, error: message };
+  }
+}
+
 export async function confirmAttempt(attemptId, source = "unknown") {
   // ✅ Atomic: only move to confirmed if not already terminal
   const attempt = await CodAttempt.findOneAndUpdate(
@@ -56,17 +139,40 @@ export async function confirmAttempt(attemptId, source = "unknown") {
   if (!attempt) {
     const existing = await CodAttempt.findById(attemptId).lean();
     if (!existing) throw new Error("Attempt not found");
-    return { ok: true, alreadyDone: true, status: existing.status };
+    const tagSync = await syncAttemptOutcomeTags(existing);
+    return {
+      ok: true,
+      alreadyDone: true,
+      status: existing.status,
+      tagSync,
+    };
   }
 
-  const shopRecord = await loadShopRecord(attempt.shop);
-  const admin = await getAdminClient(attempt.shop, {
-    accessToken: shopRecord.accessToken || "",
-    record: shopRecord,
+  const shopRecord = await loadShopRecord(attempt.shop).catch((error) => {
+    console.error(
+      "[confirm_load_shop]",
+      attempt.shop,
+      error?.message || error,
+    );
+    return null;
   });
+  const admin = shopRecord
+    ? await getAdminClient(attempt.shop, {
+        accessToken: shopRecord.accessToken || "",
+        record: shopRecord,
+      }).catch((error) => {
+        console.error(
+          "[confirm_admin_client]",
+          attempt.shop,
+          error?.message || error,
+        );
+        return null;
+      })
+    : null;
 
   // Optional merchant setting: apply confirmed Request Changes directly on Shopify order.
   if (
+    admin &&
     shopRecord?.settings?.applyRequestedChangesToOrder === true &&
     (attempt.changeProposedName ||
       attempt.changeProposedAddress ||
@@ -105,23 +211,10 @@ export async function confirmAttempt(attemptId, source = "unknown") {
     }
   }
 
-  if (attempt.stage === "post_failed_delivery") {
-    // Keep the original tag + add an explicit redelivery tag for this stage.
-    await appendOrderTag(admin, attempt.orderGid, "ORDER_CONFIRMED✅");
-    await appendOrderTag(admin, attempt.orderGid, "cod_redeliver");
-  } else {
-    await appendOrderTag(admin, attempt.orderGid, "ORDER_CONFIRMED✅");
-  }
-  await removeOrderTags(admin, attempt.orderGid, [CONFIRMATION_SENT_TAG]).catch(
-    (error) => {
-      console.error(
-        "[confirm_remove_confirmation_sent_tag]",
-        attempt.shop,
-        attempt.orderGid,
-        error?.message || error,
-      );
-    },
-  );
+  const tagSync = await syncAttemptOutcomeTags(attempt, {
+    shopRecord,
+    admin,
+  });
 
   // ✅ Analytics: track saved orders & revenue (no extra cost)
   try {
@@ -134,7 +227,7 @@ export async function confirmAttempt(attemptId, source = "unknown") {
     console.error("[recordSavedOrder]", attempt.shop, e?.message || e);
   }
 
-  return { ok: true };
+  return { ok: true, tagSync };
 }
 
 export async function cancelAttempt(attemptId, source = "unknown") {
@@ -158,26 +251,41 @@ export async function cancelAttempt(attemptId, source = "unknown") {
   if (!attempt) {
     const existing = await CodAttempt.findById(attemptId).lean();
     if (!existing) throw new Error("Attempt not found");
-    return { ok: true, alreadyDone: true, status: existing.status };
+    const tagSync = await syncAttemptOutcomeTags(existing);
+    return {
+      ok: true,
+      alreadyDone: true,
+      status: existing.status,
+      tagSync,
+    };
   }
 
-  const shopRecord = await loadShopRecord(attempt.shop);
-  const admin = await getAdminClient(attempt.shop, {
-    accessToken: shopRecord.accessToken || "",
-    record: shopRecord,
+  const shopRecord = await loadShopRecord(attempt.shop).catch((error) => {
+    console.error(
+      "[cancel_load_shop]",
+      attempt.shop,
+      error?.message || error,
+    );
+    return null;
+  });
+  const admin = shopRecord
+    ? await getAdminClient(attempt.shop, {
+        accessToken: shopRecord.accessToken || "",
+        record: shopRecord,
+      }).catch((error) => {
+        console.error(
+          "[cancel_admin_client]",
+          attempt.shop,
+          error?.message || error,
+        );
+        return null;
+      })
+    : null;
+
+  const tagSync = await syncAttemptOutcomeTags(attempt, {
+    shopRecord,
+    admin,
   });
 
-  await appendOrderTag(admin, attempt.orderGid, "ORDER_CANCELLED❌");
-  await removeOrderTags(admin, attempt.orderGid, [CONFIRMATION_SENT_TAG]).catch(
-    (error) => {
-      console.error(
-        "[cancel_remove_confirmation_sent_tag]",
-        attempt.shop,
-        attempt.orderGid,
-        error?.message || error,
-      );
-    },
-  );
-
-  return { ok: true };
+  return { ok: true, tagSync };
 }

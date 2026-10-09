@@ -25,7 +25,10 @@ export const action = async ({ request }) => {
       shop,
       error?.message || error,
     );
-    // don't fail webhook ack
+    // Retry until background access is revoked successfully.
+    return new Response("Uninstall webhook processing failed", {
+      status: 500,
+    });
   }
 
   return shopifyWebhookAck();

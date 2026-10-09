@@ -58,6 +58,7 @@ import {
 } from "../services/storageSanitizer.js";
 import { cleanupOldAgendaJobs } from "../services/agendaMaintenance.js";
 import { buildShopifyCredentialCandidateQuery } from "../services/shopifyTokenState.js";
+import { syncAttemptOutcomeTags } from "../services/attemptActions.js";
 
 const BILLING_SYNC_TTL_MIN = Number(process.env.BILLING_SYNC_TTL_MIN || 15);
 const SEND_LOCK_MIN = Number(process.env.SEND_LOCK_MIN || 5);
@@ -102,6 +103,17 @@ const CONFIRMATION_TAG_REPAIR_BATCH = Math.max(
 const CONFIRMATION_TAG_REPAIR_LOOKBACK_HOURS = Math.max(
   24,
   Number(process.env.CONFIRMATION_TAG_REPAIR_LOOKBACK_HOURS || 168),
+);
+const OUTCOME_TAG_REPAIR_INTERVAL =
+  String(process.env.OUTCOME_TAG_REPAIR_INTERVAL || "5 minutes").trim() ||
+  "5 minutes";
+const OUTCOME_TAG_REPAIR_BATCH = Math.max(
+  1,
+  Number(process.env.OUTCOME_TAG_REPAIR_BATCH || 100),
+);
+const OUTCOME_TAG_REPAIR_LOOKBACK_HOURS = Math.max(
+  24,
+  Number(process.env.OUTCOME_TAG_REPAIR_LOOKBACK_HOURS || 720),
 );
 // Shopify order tag to apply when an attempt expires due to no response.
 // Set `COD_EXPIRED_TAG=` (empty) to disable legacy tagging.
@@ -1862,6 +1874,52 @@ agenda.define("repair_missing_confirmation_sent_tags", async () => {
   }
 });
 
+agenda.define("repair_missing_outcome_tags", async () => {
+  const cutoff = new Date(
+    Date.now() - OUTCOME_TAG_REPAIR_LOOKBACK_HOURS * 60 * 60 * 1000,
+  );
+  const candidates = await CodAttempt.find({
+    status: { $in: ["confirmed", "cancelled"] },
+    orderGid: { $exists: true, $ne: null },
+    outcomeTagSyncedAt: null,
+    updatedAt: { $gte: cutoff },
+  })
+    .sort({ updatedAt: 1, _id: 1 })
+    .limit(OUTCOME_TAG_REPAIR_BATCH)
+    .lean();
+
+  if (!candidates.length) return;
+
+  const shopCache = new Map();
+  const adminCache = new Map();
+  for (const attempt of candidates) {
+    const shop = String(attempt?.shop || "").trim();
+    if (!shop || !attempt?.orderGid) continue;
+
+    let shopRecord = shopCache.get(shop);
+    if (shopRecord === undefined) {
+      shopRecord = await Shop.findOne({ shop })
+        .select({ accessToken: 1 })
+        .lean()
+        .catch(() => null);
+      shopCache.set(shop, shopRecord || null);
+    }
+    if (!shopRecord) continue;
+
+    let admin = adminCache.get(shop);
+    if (admin === undefined) {
+      admin = await getAdminClient(shop, {
+        accessToken: shopRecord.accessToken || "",
+        record: shopRecord,
+      }).catch(() => null);
+      adminCache.set(shop, admin || null);
+    }
+    if (!admin) continue;
+
+    await syncAttemptOutcomeTags(attempt, { shopRecord, admin });
+  }
+});
+
 // Mark attempts as expired when customers never reply.
 // Pre-dispatch confirmation attempts expire after a mandatory 48h.
 // Other stages still use each shop's `maxAttemptAgeHours` setting.
@@ -2115,6 +2173,7 @@ export async function startAgenda() {
     CONFIRMATION_TAG_REPAIR_INTERVAL,
     "repair_missing_confirmation_sent_tags",
   );
+  await agenda.every(OUTCOME_TAG_REPAIR_INTERVAL, "repair_missing_outcome_tags");
 
   // Keep BYON Meta tokens fresh before expiry (configuration tokens expire).
   await agenda.every(BYON_TOKEN_REFRESH_INTERVAL, "refresh_byon_tokens");
@@ -2128,6 +2187,7 @@ export async function startAgenda() {
   await agenda.now("recover_stale_pending_attempts");
   await agenda.now("repair_stuck_attempt_queues");
   await agenda.now("repair_missing_confirmation_sent_tags");
+  await agenda.now("repair_missing_outcome_tags");
   await agenda.now("migrate_legacy_shopify_offline_tokens");
 
   // Expire requests that received no customer response within the configured window.

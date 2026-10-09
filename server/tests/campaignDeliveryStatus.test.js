@@ -93,8 +93,18 @@ beforeEach(async () => {
 after(async () => {
   await mongoose.disconnect().catch(() => null);
   if (mongod) {
-    mongod.kill("SIGTERM");
-    await new Promise((resolve) => mongod.once("exit", resolve));
+    await new Promise((resolve) => {
+      if (mongod.exitCode !== null || mongod.signalCode) return resolve();
+      const forceTimer = setTimeout(() => {
+        if (mongod.exitCode === null) mongod.kill("SIGKILL");
+        resolve();
+      }, 3_000);
+      mongod.once("exit", () => {
+        clearTimeout(forceTimer);
+        resolve();
+      });
+      mongod.kill("SIGTERM");
+    });
   }
   if (dbPath) fs.rmSync(dbPath, { recursive: true, force: true });
 });

@@ -10,6 +10,46 @@ function positiveNumber(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function validateProductionEnvironment() {
+  if (String(process.env.NODE_ENV || "").toLowerCase() !== "production") {
+    return;
+  }
+
+  const missing = [
+    "BACKEND_BASE_URL",
+    "SHOPIFY_APP_URL",
+    "SHOPIFY_API_KEY",
+    "SHOPIFY_API_SECRET",
+    "INTERNAL_SYNC_SECRET",
+  ].filter((name) => !String(process.env[name] || "").trim());
+  if (
+    !String(
+      process.env.SHOPIFY_SESSION_MONGO_URI || process.env.MONGO_URI || "",
+    ).trim()
+  ) {
+    missing.push("SHOPIFY_SESSION_MONGO_URI (or MONGO_URI)");
+  }
+  if (missing.length) {
+    throw new Error(
+      `Missing required production environment variables: ${missing.join(", ")}`,
+    );
+  }
+
+  for (const name of ["BACKEND_BASE_URL", "SHOPIFY_APP_URL"]) {
+    let url;
+    try {
+      url = new URL(process.env[name]);
+    } catch {
+      throw new Error(`${name} must be a valid absolute URL.`);
+    }
+    if (url.protocol !== "https:") {
+      throw new Error(`${name} must use HTTPS in production.`);
+    }
+  }
+}
+
+validateProductionEnvironment();
+
 const port = positiveNumber(process.env.PORT, 3000);
 const host = String(process.env.BIND_HOST || "0.0.0.0").trim();
 const keepAliveTimeout = positiveNumber(

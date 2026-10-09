@@ -12,6 +12,7 @@ import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import { backendGet, backendPost } from "../server/backend.server";
 import { handleByonRouteAction } from "../server/byonActions.server";
+import { prepareShopifyOfflineSession } from "../server/shopifyOfflineSession.server";
 import { UsageWidget } from "../components/AnalyticsWidgets";
 import ByonOnboardingFlow from "../components/ByonOnboardingFlow";
 import ConfirmDialog from "../components/ConfirmDialog";
@@ -25,8 +26,9 @@ import {
 import { withShopParams } from "../utils/embedded";
 import { formatDateTime, formatNumber } from "../utils/format";
 import { shouldShowPkrInfo } from "../utils/billingPresentation";
+import { isShopifyBillingTestMode } from "../utils/billingMode.server";
 import { getMerchantTimezone } from "../utils/shopTimezone.server";
-import { resolvePublicAppOrigin } from "../utils/publicOrigin";
+import { resolveRequestAppOrigin } from "../utils/publicOrigin";
 
 const toObject = (v) => (v && typeof v === "object" ? v : {});
 const toArray = (v) => (Array.isArray(v) ? v : []);
@@ -67,12 +69,12 @@ function senderModeLabel(mode) {
   return mode === SENDER_MODE_OWN ? "Your Own Number" : "OrderX Number";
 }
 
-function resolveAppOrigin(reqUrl) {
+function resolveAppOrigin(request) {
   return (
-    resolvePublicAppOrigin(
-      reqUrl?.toString?.() || reqUrl?.origin || "",
+    resolveRequestAppOrigin(
+      request,
       process.env.SHOPIFY_APP_URL || process.env.APP_URL || "",
-    ) || reqUrl.origin
+    ) || new URL(request.url).origin
   );
 }
 
@@ -259,11 +261,31 @@ export const action = async ({ request }) => {
     const planKey = String(form.get("planKey") || "");
     if (!planKey) return { ok: false, intent, error: "Missing planKey" };
 
+    // A merchant can choose Growth immediately after install. Make sure the
+    // backend has the authenticated offline token and store-country context
+    // before validation; otherwise the first paid-plan attempt can fail until
+    // activating Free happens to create/sync the Shop record.
+    try {
+      const requestUrl = new URL(request.url);
+      await prepareShopifyOfflineSession({
+        shop,
+        fallbackSession: session,
+        host: requestUrl.searchParams.get("host") || session.host || "",
+      });
+    } catch (e) {
+      return {
+        ok: false,
+        intent,
+        error: `Could not prepare Shopify billing: ${e?.message || "Failed"}`,
+        errorData: e?.data || e?.errorData || null,
+      };
+    }
+
     const current = toObject(
       await backendGet("/api/billing/status", shop).catch(() => ({})),
     );
 
-    const isTest = false;
+    const isTest = isShopifyBillingTestMode();
     const targetSenderMode = inferSenderModeFromPlanKey(planKey);
     const currentSenderMode = inferSenderModeFromPlanKey(current?.planKey);
     const switchingSenderMode =
@@ -331,7 +353,7 @@ export const action = async ({ request }) => {
     }
 
     const reqUrl = new URL(request.url);
-    const appOrigin = resolveAppOrigin(reqUrl);
+    const appOrigin = resolveAppOrigin(request);
     const returnUrl = new URL("/app/billing/confirm", appOrigin);
     returnUrl.searchParams.set("shop", shop);
     const host = reqUrl.searchParams.get("host") || session.host || "";
@@ -352,6 +374,56 @@ export const action = async ({ request }) => {
           error: `Backend check failed: ${e?.message || "Failed"}`,
           errorData: e?.data || e?.errorData || null,
         };
+      }
+
+      // Make retries idempotent. If Shopify already has this plan (for
+      // example, the merchant approved it but the first callback was opened
+      // through an older dev tunnel), sync it instead of creating another
+      // billing request that can appear to load forever.
+      const existingPayment = await billing
+        .check({ plans: [planKey], isTest })
+        .catch(() => null);
+      if (existingPayment?.hasActivePayment) {
+        const reqUrl = new URL(request.url);
+        const host = reqUrl.searchParams.get("host") || session.host || "";
+        try {
+          await prepareShopifyOfflineSession({
+            shop,
+            fallbackSession: session,
+            host,
+          });
+          const billingStatus = await backendPost(
+            "/api/billing/sync?force=1",
+            shop,
+            { planKey },
+          );
+          if (
+            billingStatus?.active === true &&
+            String(billingStatus?.planKey || "").trim() === planKey
+          ) {
+            return {
+              ok: true,
+              intent: "sync_billing",
+              billing: billingStatus,
+            };
+          }
+          return {
+            ok: false,
+            intent,
+            error:
+              "Shopify approved this plan, but OrderX could not refresh it yet. Please click Refresh billing and try again.",
+            billing: billingStatus,
+          };
+        } catch (e) {
+          return {
+            ok: false,
+            intent,
+            error:
+              e?.message ||
+              "Shopify approved this plan, but OrderX could not refresh it yet. Please retry Refresh billing.",
+            errorData: e?.data || e?.errorData || null,
+          };
+        }
       }
 
       // This call throws a redirect Response to Shopify billing confirmation.
@@ -1119,8 +1191,7 @@ export default function SettingsPage() {
     billingPlanSenderMode === SENDER_MODE_OWN ||
     billing?.plan?.quotaManagedByMeta === true;
   const isByonFreeTrial = isByonPlan && billingType === BILLING_TYPE_FREE_CAP;
-  const isOrderXFreePlan =
-    !isByonPlan && billingType === BILLING_TYPE_FREE_CAP;
+  const isOrderXFreePlan = !isByonPlan && billingType === BILLING_TYPE_FREE_CAP;
   const byonTemplateCap = Number(
     byonUsage.outboundMessageCap ??
       billing?.plan?.outboundMessageCap ??
@@ -1513,8 +1584,8 @@ export default function SettingsPage() {
               {activeSenderMode === SENDER_MODE_OWN ? null : ( // </s-banner> //   status before asking you to add anything again. //   OrderX will automatically refresh the English template pack //   reconnect to a different number or WhatsApp Business account, //   Manage the connected WhatsApp number from here. If you // <s-banner tone="info">
                 <s-banner tone="warning">
                   You are not currently sending through Your Own Number, but
-                  OrderX has a saved BYON setup. You can reconnect or refresh
-                  it here before switching plans.
+                  OrderX has a saved BYON setup. You can reconnect or refresh it
+                  here before switching plans.
                 </s-banner>
               )}
               <SurfaceCard padding="base">
@@ -1595,8 +1666,8 @@ export default function SettingsPage() {
                   <s-banner tone="warning">
                     Meta is still reviewing the English template pack. Approval
                     often lands within a few hours and can sometimes take up to
-                    48 hours. OrderX will start automation automatically as
-                    soon as approval is complete.
+                    48 hours. OrderX will start automation automatically as soon
+                    as approval is complete.
                   </s-banner>
                 </div>
               ) : null}

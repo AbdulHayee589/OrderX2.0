@@ -34,3 +34,16 @@ test("uninstall revokes canonical session state and order processing has a uniqu
     /index\(\{ shop: 1, orderGid: 1, stage: 1 \}, \{ unique: true \}\)/,
   );
 });
+
+test("terminal order tags are retryable without blocking customer actions", () => {
+  const actions = read("services/attemptActions.js");
+  const definitions = read("jobs/definitions.js");
+  const attemptModel = read("models/CodAttempt.js");
+
+  assert.match(actions, /export async function syncAttemptOutcomeTags/);
+  assert.match(actions, /appendOrderTags\(resolvedAdmin, attempt\.orderGid, tags\)/);
+  assert.match(actions, /if \(throwOnError\) throw error/);
+  assert.match(definitions, /define\("repair_missing_outcome_tags"/);
+  assert.match(definitions, /every\(OUTCOME_TAG_REPAIR_INTERVAL, "repair_missing_outcome_tags"\)/);
+  assert.match(attemptModel, /outcomeTagSyncedAt/);
+});

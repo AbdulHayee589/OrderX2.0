@@ -13,16 +13,21 @@ import { getAdminClient } from "../utils/shopifyAdmin.js";
 import { resolveGrowthMessagePricing } from "./countryPricing.js";
 import { buildShopifyCredentialCandidateQuery } from "./shopifyTokenState.js";
 
-const PAKISTAN_COUNTRY_CODE = "PK";
 const SHOPIFY_MIN_USAGE_AMOUNT_USD = 0.01;
-const PAKISTAN_BATCH_LOCK_WINDOW_MS = Number(
-  process.env.PAKISTAN_BATCH_LOCK_WINDOW_MS || 15_000,
+const USAGE_BATCH_LOCK_WINDOW_MS = Number(
+  process.env.USAGE_BATCH_LOCK_WINDOW_MS ||
+    process.env.PAKISTAN_BATCH_LOCK_WINDOW_MS ||
+    15_000,
 );
-const PAKISTAN_BATCH_LOCK_RETRY_MS = Number(
-  process.env.PAKISTAN_BATCH_LOCK_RETRY_MS || 150,
+const USAGE_BATCH_LOCK_RETRY_MS = Number(
+  process.env.USAGE_BATCH_LOCK_RETRY_MS ||
+    process.env.PAKISTAN_BATCH_LOCK_RETRY_MS ||
+    150,
 );
-const PAKISTAN_BATCH_LOCK_ATTEMPTS = Number(
-  process.env.PAKISTAN_BATCH_LOCK_ATTEMPTS || 25,
+const USAGE_BATCH_LOCK_ATTEMPTS = Number(
+  process.env.USAGE_BATCH_LOCK_ATTEMPTS ||
+    process.env.PAKISTAN_BATCH_LOCK_ATTEMPTS ||
+    25,
 );
 const USAGE_CHARGE_LOCK_WINDOW_MS = Number(
   process.env.USAGE_CHARGE_LOCK_WINDOW_MS || 15_000,
@@ -46,10 +51,28 @@ function roundCurrency(value, digits = 2) {
   return Number(n.toFixed(digits));
 }
 
-function shouldUsePakistanThresholdBatch(pricingBasisUsd) {
+export function shouldUseThresholdBatch(pricingBasisUsd) {
   const amount = Number(pricingBasisUsd || 0);
   if (!Number.isFinite(amount) || amount <= 0) return false;
   return amount + 1e-9 < SHOPIFY_MIN_USAGE_AMOUNT_USD;
+}
+
+export function calculateThresholdBatchCharge({ accruedUsd, reservedOrChargedUsd }) {
+  const outstandingUsd = roundCurrency(
+    Math.max(0, Number(accruedUsd || 0) - Number(reservedOrChargedUsd || 0)),
+    4,
+  );
+  const chargeAmount = roundCurrency(
+    Math.floor((outstandingUsd + 1e-9) / SHOPIFY_MIN_USAGE_AMOUNT_USD) *
+      SHOPIFY_MIN_USAGE_AMOUNT_USD,
+    2,
+  );
+  return {
+    outstandingUsd,
+    chargeAmount:
+      chargeAmount >= SHOPIFY_MIN_USAGE_AMOUNT_USD ? chargeAmount : 0,
+    carryAfterUsd: roundCurrency(Math.max(0, outstandingUsd - chargeAmount), 4),
+  };
 }
 
 function resolveOwnNumberIncludedCap(plan) {
@@ -96,9 +119,12 @@ function buildDescription({
   quantity = 1,
 }) {
   const orderPart = orderGid ? String(orderGid).split("/").pop() || "" : "";
-  if (String(recipientCountryCode || "").trim().toUpperCase() === PAKISTAN_COUNTRY_CODE) {
+  const normalizedCountryCode = String(recipientCountryCode || "")
+    .trim()
+    .toUpperCase();
+  if (normalizedCountryCode) {
     const amountPart = chargeAmount > 0 ? ` (${chargeAmount.toFixed(2)} USD)` : "";
-    return `Pakistan WhatsApp usage batch for ${quantity} message${quantity === 1 ? "" : "s"}${orderPart ? ` — order ${orderPart}` : ""}${amountPart}`;
+    return `${normalizedCountryCode} WhatsApp usage batch for ${quantity} message${quantity === 1 ? "" : "s"}${orderPart ? ` — order ${orderPart}` : ""}${amountPart}`;
   }
   if (kind) {
     return `WhatsApp message (${String(kind)})${orderPart ? ` for order ${orderPart}` : ""}`;
@@ -386,24 +412,24 @@ async function markUsageChargeTerminalFailure({ row, error, skipped = false }) {
   };
 }
 
-async function withPakistanBatchLock(shop, fn) {
+async function withUsageBatchLock(shop, fn) {
   const shopDomain = String(shop || "").trim();
-  if (!shopDomain) throw new Error("Missing shop for Pakistan usage batching");
+  if (!shopDomain) throw new Error("Missing shop for usage batching");
 
-  for (let attempt = 0; attempt < PAKISTAN_BATCH_LOCK_ATTEMPTS; attempt += 1) {
-    const lockUntil = new Date(Date.now() + PAKISTAN_BATCH_LOCK_WINDOW_MS);
+  for (let attempt = 0; attempt < USAGE_BATCH_LOCK_ATTEMPTS; attempt += 1) {
+    const lockUntil = new Date(Date.now() + USAGE_BATCH_LOCK_WINDOW_MS);
     const acquired = await Shop.findOneAndUpdate(
       {
         shop: shopDomain,
         $or: [
-          { "billing.pakistanBatchLockUntil": { $exists: false } },
-          { "billing.pakistanBatchLockUntil": null },
-          { "billing.pakistanBatchLockUntil": { $lt: new Date() } },
+          { "billing.usageBatchLockUntil": { $exists: false } },
+          { "billing.usageBatchLockUntil": null },
+          { "billing.usageBatchLockUntil": { $lt: new Date() } },
         ],
       },
       {
         $set: {
-          "billing.pakistanBatchLockUntil": lockUntil,
+          "billing.usageBatchLockUntil": lockUntil,
         },
       },
       {
@@ -418,16 +444,16 @@ async function withPakistanBatchLock(shop, fn) {
       } finally {
         await Shop.updateOne(
           { shop: shopDomain },
-          { $set: { "billing.pakistanBatchLockUntil": null } },
+          { $set: { "billing.usageBatchLockUntil": null } },
         ).catch(() => {});
       }
     }
 
-    await wait(PAKISTAN_BATCH_LOCK_RETRY_MS);
+    await wait(USAGE_BATCH_LOCK_RETRY_MS);
   }
 
   throw new Error(
-    "OrderX could not acquire the Pakistan billing lock. Please retry in a few seconds.",
+    "OrderX could not acquire the usage billing lock. Please retry in a few seconds.",
   );
 }
 
@@ -571,14 +597,17 @@ async function updateWaMessageUsageLog({
   ).catch(() => {});
 }
 
-async function settleBufferedPakistanRows({
+async function settleBufferedThresholdRows({
   shop,
   billingCycleId,
+  recipientCountryCode,
   currentWaMessageId,
   batchGroupKey,
   pricingBasisUsd,
   chargeAmount,
 }) {
+  const countryCode = String(recipientCountryCode || "").trim().toUpperCase();
+  if (!countryCode) return [];
   const settleCount = Math.max(
     0,
     Math.ceil(Number(chargeAmount || 0) / Math.max(Number(pricingBasisUsd || 0), 0.0001)) - 1,
@@ -588,7 +617,7 @@ async function settleBufferedPakistanRows({
   const rows = await BillingUsageCharge.find({
     shop,
     billingCycleId,
-    recipientCountryCode: PAKISTAN_COUNTRY_CODE,
+    recipientCountryCode: countryCode,
     status: "buffered",
     waMessageId: { $ne: currentWaMessageId },
   })
@@ -617,7 +646,7 @@ async function settleBufferedPakistanRows({
         shop,
         waMessageId: row.waMessageId,
         usageChargeState: "settled",
-        usageBillingStrategy: "pakistan_threshold_batch",
+        usageBillingStrategy: "threshold_batch",
         usageBatchGroupKey: batchGroupKey,
       }),
     ),
@@ -736,10 +765,15 @@ async function submitPendingUsageRow({
       );
     });
 
-    if (row?.billingStrategy === "pakistan_threshold_batch") {
-      await settleBufferedPakistanRows({
+    if (
+      ["threshold_batch", "pakistan_threshold_batch"].includes(
+        row?.billingStrategy,
+      )
+    ) {
+      await settleBufferedThresholdRows({
         shop,
         billingCycleId: row?.billingCycleId,
+        recipientCountryCode: row?.recipientCountryCode,
         currentWaMessageId: row?.waMessageId,
         batchGroupKey: row?.batchGroupKey,
         pricingBasisUsd: row?.pricingBasisUsd,
@@ -904,7 +938,7 @@ function buildExistingResult(existing) {
   };
 }
 
-async function resumeAnyPendingPakistanBatch({
+async function resumeAnyPendingThresholdBatch({
   shop,
   accessToken,
   subscriptionLineItemId,
@@ -914,7 +948,7 @@ async function resumeAnyPendingPakistanBatch({
   const pendingRow = await BillingUsageCharge.findOne({
     shop,
     planKey: plan.key,
-    billingStrategy: "pakistan_threshold_batch",
+    billingStrategy: { $in: ["threshold_batch", "pakistan_threshold_batch"] },
     status: "pending",
   })
     .sort({ createdAt: 1 })
@@ -1022,7 +1056,7 @@ async function resumeAnyPendingPakistanBatch({
   }
 }
 
-async function recordPakistanGrowthUsageMessage({
+async function recordThresholdBatchedGrowthUsageMessage({
   shop,
   record,
   plan,
@@ -1033,7 +1067,13 @@ async function recordPakistanGrowthUsageMessage({
   pricing,
   subscriptionLineItemId,
 }) {
-  return withPakistanBatchLock(shop, async () => {
+  const recipientCountryCode = String(pricing?.recipientCountryCode || "")
+    .trim()
+    .toUpperCase();
+  if (!recipientCountryCode) {
+    return { ok: false, skipped: true, reason: "missing_recipient_country" };
+  }
+  return withUsageBatchLock(shop, async () => {
     const existing = await BillingUsageCharge.findOne({
       shop,
       waMessageId: messageId,
@@ -1047,7 +1087,7 @@ async function recordPakistanGrowthUsageMessage({
       plan,
     );
 
-    const pendingResume = await resumeAnyPendingPakistanBatch({
+    const pendingResume = await resumeAnyPendingThresholdBatch({
       shop,
       accessToken: record.accessToken,
       subscriptionLineItemId,
@@ -1089,13 +1129,13 @@ async function recordPakistanGrowthUsageMessage({
             pricingBasisUsd: messageBasisUsd,
             currencyCode:
               String(plan?.usagePrice?.currencyCode || "USD").trim() || "USD",
-            recipientCountryCode: pricing?.recipientCountryCode || PAKISTAN_COUNTRY_CODE,
+            recipientCountryCode,
             storeCountryCode: pricing?.storeCountryCode || null,
             crossBorderRateApplied: !!pricing?.crossBorderRateApplied,
             capUnitsConsumed: Number(pricing?.capUnitsConsumed || 1),
-            billingStrategy: "pakistan_threshold_batch",
+            billingStrategy: "threshold_batch",
             description: buildDescription({ kind, orderGid, attemptId }),
-            idempotencyKey: `orderx:${shop}:${messageId}:pk-buffer`,
+            idempotencyKey: `orderx:${shop}:${messageId}:usage-buffer`,
           },
           $set: {
             status: "skipped",
@@ -1114,7 +1154,7 @@ async function recordPakistanGrowthUsageMessage({
         usagePricingBasisUsd: messageBasisUsd,
         usageChargeUsd: 0,
         usageChargeState: "skipped",
-        usageBillingStrategy: "pakistan_threshold_batch",
+        usageBillingStrategy: "threshold_batch",
         usageBatchGroupKey: null,
         capUnitsConsumed: Number(pricing?.capUnitsConsumed || 1),
       });
@@ -1140,13 +1180,13 @@ async function recordPakistanGrowthUsageMessage({
           amount: 0,
           pricingBasisUsd: messageBasisUsd,
           currencyCode: String(plan?.usagePrice?.currencyCode || "USD").trim() || "USD",
-          recipientCountryCode: pricing?.recipientCountryCode || PAKISTAN_COUNTRY_CODE,
+          recipientCountryCode,
           storeCountryCode: pricing?.storeCountryCode || null,
           crossBorderRateApplied: !!pricing?.crossBorderRateApplied,
           capUnitsConsumed: Number(pricing?.capUnitsConsumed || 1),
-          billingStrategy: "pakistan_threshold_batch",
+          billingStrategy: "threshold_batch",
           description,
-          idempotencyKey: `orderx:${shop}:${messageId}:pk-buffer`,
+          idempotencyKey: `orderx:${shop}:${messageId}:usage-buffer`,
         },
         $set: {
           status: "buffered",
@@ -1165,20 +1205,12 @@ async function recordPakistanGrowthUsageMessage({
     const totals = await aggregateCycleUsageLedger({
       shop,
       billingCycleId: cycleId,
-      countryCode: PAKISTAN_COUNTRY_CODE,
+      countryCode: recipientCountryCode,
     });
-    const outstandingUsd = roundCurrency(
-      Math.max(0, totals.accruedUsd - totals.reservedOrChargedUsd),
-      4,
-    );
-    const chargeAmount = roundCurrency(
-      Math.floor((outstandingUsd + 1e-9) / SHOPIFY_MIN_USAGE_AMOUNT_USD) *
-        SHOPIFY_MIN_USAGE_AMOUNT_USD,
-      2,
-    );
+    const { outstandingUsd, chargeAmount, carryAfterUsd } =
+      calculateThresholdBatchCharge(totals);
 
     if (chargeAmount < SHOPIFY_MIN_USAGE_AMOUNT_USD) {
-      const carryAfterUsd = outstandingUsd;
       await BillingUsageCharge.updateOne(
         { shop, waMessageId: messageId },
         {
@@ -1202,7 +1234,7 @@ async function recordPakistanGrowthUsageMessage({
         usagePricingBasisUsd: messageBasisUsd,
         usageChargeUsd: 0,
         usageChargeState: "buffered",
-        usageBillingStrategy: "pakistan_threshold_batch",
+        usageBillingStrategy: "threshold_batch",
         usageBatchGroupKey: null,
         capUnitsConsumed: Number(pricing?.capUnitsConsumed || 1),
       });
@@ -1217,13 +1249,9 @@ async function recordPakistanGrowthUsageMessage({
 
     const chargedBeforeUsd = roundCurrency(totals.reservedOrChargedUsd, 2);
     const batchIndex = Math.floor((chargedBeforeUsd + 1e-9) / SHOPIFY_MIN_USAGE_AMOUNT_USD) + 1;
-    const batchGroupKey = `${shop}:${cycleId}:${PAKISTAN_COUNTRY_CODE}:batch:${batchIndex}`;
-    const idempotencyKey = `orderx:pk-batch:${shop}:${cycleId}:${batchIndex}:${chargeAmount.toFixed(2)}`;
+    const batchGroupKey = `${shop}:${cycleId}:${recipientCountryCode}:batch:${batchIndex}`;
+    const idempotencyKey = `orderx:usage-batch:${shop}:${cycleId}:${recipientCountryCode}:${batchIndex}:${chargeAmount.toFixed(2)}`;
     const carryBeforeUsd = outstandingUsd;
-    const carryAfterUsd = roundCurrency(
-      Math.max(0, carryBeforeUsd - chargeAmount),
-      4,
-    );
 
     const quantity = Math.max(
       1,
@@ -1233,7 +1261,7 @@ async function recordPakistanGrowthUsageMessage({
       kind,
       orderGid,
       attemptId,
-      recipientCountryCode: PAKISTAN_COUNTRY_CODE,
+      recipientCountryCode,
       chargeAmount,
       quantity,
     });
@@ -1247,7 +1275,7 @@ async function recordPakistanGrowthUsageMessage({
           amount: chargeAmount,
           pricingBasisUsd: messageBasisUsd,
           currencyCode: String(plan?.usagePrice?.currencyCode || "USD").trim() || "USD",
-          billingStrategy: "pakistan_threshold_batch",
+          billingStrategy: "threshold_batch",
           batchGroupKey,
           idempotencyKey,
           description: batchDescription,
@@ -1269,7 +1297,7 @@ async function recordPakistanGrowthUsageMessage({
       usagePricingBasisUsd: messageBasisUsd,
       usageChargeUsd: chargeAmount,
       usageChargeState: "pending",
-      usageBillingStrategy: "pakistan_threshold_batch",
+      usageBillingStrategy: "threshold_batch",
       usageBatchGroupKey: batchGroupKey,
       capUnitsConsumed: Number(pricing?.capUnitsConsumed || 1),
     });
@@ -1305,7 +1333,7 @@ async function recordPakistanGrowthUsageMessage({
             recipientCountryCode: pricing?.recipientCountryCode || null,
             storeCountryCode: pricing?.storeCountryCode || null,
             capUnitsConsumed: Number(pricing?.capUnitsConsumed || 1),
-            billingStrategy: "pakistan_threshold_batch",
+            billingStrategy: "threshold_batch",
             batchGroupKey,
             pricingBasisUsd: messageBasisUsd,
           },
@@ -1364,7 +1392,7 @@ async function recordPakistanGrowthUsageMessage({
         usagePricingBasisUsd: messageBasisUsd,
         usageChargeUsd: nextStatus === "skipped" ? 0 : chargeAmount,
         usageChargeState: nextStatus,
-        usageBillingStrategy: "pakistan_threshold_batch",
+        usageBillingStrategy: "threshold_batch",
         usageBatchGroupKey: batchGroupKey,
         capUnitsConsumed: Number(pricing?.capUnitsConsumed || 1),
       });
@@ -1379,7 +1407,7 @@ async function recordPakistanGrowthUsageMessage({
           waMessageId: messageId,
           billingCycleId: cycleId,
           recipientCountryCode: pricing?.recipientCountryCode || null,
-          billingStrategy: "pakistan_threshold_batch",
+          billingStrategy: "threshold_batch",
           batchGroupKey,
         },
       });
@@ -1435,15 +1463,15 @@ export async function recordGrowthUsageMessage({
     return { ok: false, skipped: true, reason: "missing_usage_line_item" };
   }
 
-  const pendingPakistanResume = await resumeAnyPendingPakistanBatch({
+  const pendingBatchResume = await resumeAnyPendingThresholdBatch({
     shop: shopDomain,
     accessToken: record.accessToken,
     subscriptionLineItemId,
     record,
     plan,
   });
-  if (pendingPakistanResume?.ok === false) {
-    return pendingPakistanResume;
+  if (pendingBatchResume?.ok === false) {
+    return pendingBatchResume;
   }
 
   const pricing = await resolveGrowthMessagePricing({
@@ -1458,11 +1486,8 @@ export async function recordGrowthUsageMessage({
     return { ok: false, skipped: true, reason: "missing_usage_price" };
   }
 
-  if (
-    pricing?.recipientCountryCode === PAKISTAN_COUNTRY_CODE &&
-    shouldUsePakistanThresholdBatch(pricingBasisUsd)
-  ) {
-    return recordPakistanGrowthUsageMessage({
+  if (shouldUseThresholdBatch(pricingBasisUsd)) {
+    return recordThresholdBatchedGrowthUsageMessage({
       shop: shopDomain,
       record,
       plan,

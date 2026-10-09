@@ -30,4 +30,18 @@ The Shopify app configuration uses client ID
 provide the environment-specific secrets before running locally or deploying.
 The production frontend is `https://app.orderxapp.com` and the internal API
 backend is `https://api.orderxapp.com`.
+
+## Release verification
+
+Use Node 24 LTS, then run:
+
+```sh
+cd server && npm ci && npm test
+cd ../builderdev && npm ci && npm test && npm run lint && npm run typecheck && npm run build
+```
+
+Before the first production start, create the MongoDB indexes with
+`cd server && npm run db:ensure-indexes`. Use a MongoDB replica set for atomic
+Shopify token rotation. The complete external setup and launch gates are in
+[`docs/production-launch-checklist.md`](docs/production-launch-checklist.md).
 # OrderX2.0

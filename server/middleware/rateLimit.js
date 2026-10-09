@@ -4,8 +4,9 @@ function toPositiveNumber(value, fallback) {
 }
 
 function getClientIp(req) {
-  const xff = String(req.headers["x-forwarded-for"] || "").trim();
-  if (xff) return xff.split(",")[0].trim();
+  // Express resolves req.ip using the configured trust-proxy hop count.
+  // Reading X-Forwarded-For directly would let a client spoof a fresh IP and
+  // bypass every in-memory rate limit when the API is reachable directly.
   return String(req.ip || req.socket?.remoteAddress || "unknown");
 }
 

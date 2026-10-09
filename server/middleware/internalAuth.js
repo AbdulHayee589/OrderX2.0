@@ -24,8 +24,8 @@ function isLoopbackIp(ip) {
 }
 
 function getClientIp(req) {
-  const xff = String(req.headers["x-forwarded-for"] || "").trim();
-  if (xff) return xff.split(",")[0].trim();
+  // req.ip already applies Express' trust-proxy policy. Trusting the raw
+  // forwarded header here would make REQUIRE_LOOPBACK_INTERNAL spoofable.
   return String(req.ip || req.socket?.remoteAddress || "");
 }
 

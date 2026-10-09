@@ -42,36 +42,6 @@ function getMongoClientPromise() {
 }
 
 let indexesReadyPromise;
-let legacyPrismaStoragePromise;
-let legacyPrismaAvailable = true;
-
-async function getLegacyPrismaStorage() {
-  if (!legacyPrismaAvailable) return null;
-  if (!legacyPrismaStoragePromise) {
-    legacyPrismaStoragePromise = (async () => {
-      try {
-        const [{ PrismaSessionStorage }, { PrismaClient }] = await Promise.all([
-          import("@shopify/shopify-app-session-storage-prisma"),
-          import("@prisma/client"),
-        ]);
-        const prisma = new PrismaClient();
-        return new PrismaSessionStorage(prisma);
-      } catch (error) {
-        const message = String(error?.message || "");
-        if (
-          message.includes("did not initialize yet") ||
-          message.includes("Cannot find module") ||
-          message.includes("no such file")
-        ) {
-          legacyPrismaAvailable = false;
-          return null;
-        }
-        throw error;
-      }
-    })();
-  }
-  return legacyPrismaStoragePromise;
-}
 
 async function getSessionCollection() {
   const client = await getMongoClientPromise();
@@ -260,46 +230,6 @@ function tokenStatusForSession(session) {
   return session.refreshToken ? "active" : "legacy";
 }
 
-async function loadLegacyPrismaSession(id) {
-  const storage = await getLegacyPrismaStorage();
-  if (!storage) return undefined;
-  try {
-    return await storage.loadSession(id);
-  } catch (error) {
-    const message = String(error?.message || "");
-    if (
-      message.includes("does not exist") ||
-      message.includes("no such table") ||
-      message.includes("Can't reach database server") ||
-      message.includes("Error querying the database")
-    ) {
-      legacyPrismaAvailable = false;
-      return undefined;
-    }
-    throw error;
-  }
-}
-
-async function loadLegacyPrismaSessionsByShop(shop) {
-  const storage = await getLegacyPrismaStorage();
-  if (!storage?.findSessionsByShop) return [];
-  try {
-    return (await storage.findSessionsByShop(shop)) || [];
-  } catch (error) {
-    const message = String(error?.message || "");
-    if (
-      message.includes("does not exist") ||
-      message.includes("no such table") ||
-      message.includes("Can't reach database server") ||
-      message.includes("Error querying the database")
-    ) {
-      legacyPrismaAvailable = false;
-      return [];
-    }
-    throw error;
-  }
-}
-
 class MongoSessionStorage {
   async storeSession(session) {
     assertCompleteOfflineSession(session);
@@ -366,28 +296,12 @@ class MongoSessionStorage {
         ? mongoSession
         : undefined;
     }
-    const legacySession = await loadLegacyPrismaSession(id);
-    if (
-      legacySession &&
-      !shouldTreatOfflineSessionAsMissing(legacySession)
-    ) {
-      await this.storeSession(legacySession);
-      return legacySession;
-    }
     return undefined;
   }
 
   async deleteSession(id) {
     const collection = await getSessionCollection();
     await collection.deleteOne({ id });
-    const storage = await getLegacyPrismaStorage();
-    if (storage) {
-      try {
-        await storage.deleteSession(id);
-      } catch (error) {
-        void error;
-      }
-    }
     return true;
   }
 
@@ -395,14 +309,6 @@ class MongoSessionStorage {
     if (!Array.isArray(ids) || ids.length === 0) return true;
     const collection = await getSessionCollection();
     await collection.deleteMany({ id: { $in: ids } });
-    const storage = await getLegacyPrismaStorage();
-    if (storage?.deleteSessions) {
-      try {
-        await storage.deleteSessions(ids);
-      } catch (error) {
-        void error;
-      }
-    }
     return true;
   }
 
@@ -419,13 +325,7 @@ class MongoSessionStorage {
         (session) =>
           session && !shouldTreatOfflineSessionAsMissing(session),
       );
-    if (mongoSessions.length > 0) return mongoSessions;
-    if (docs.length > 0) return [];
-    const legacySessions = await loadLegacyPrismaSessionsByShop(shop);
-    if (legacySessions.length > 0) {
-      await Promise.allSettled(legacySessions.map((session) => this.storeSession(session)));
-    }
-    return legacySessions;
+    return mongoSessions;
   }
 }
 

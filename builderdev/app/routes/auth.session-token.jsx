@@ -1,6 +1,6 @@
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { addDocumentResponseHeaders } from "../shopify.server";
-import { resolvePublicAppOrigin } from "../utils/publicOrigin";
+import { resolveRequestAppOrigin } from "../utils/publicOrigin";
 
 const APP_BRIDGE_CDN = "https://cdn.shopify.com/shopifycloud/app-bridge.js";
 
@@ -27,11 +27,11 @@ function isSessionTokenPath(pathname = "") {
   );
 }
 
-function resolveTargetUrl(requestUrl) {
+function resolveTargetUrl(request) {
+  const requestUrl = new URL(request.url);
   const appUrl = String(process.env.SHOPIFY_APP_URL || "").trim();
-  const requestOrigin = `${requestUrl.protocol}//${requestUrl.host}`;
-  const appOrigin = resolvePublicAppOrigin(
-    requestOrigin,
+  const appOrigin = resolveRequestAppOrigin(
+    request,
     appUrl || process.env.APP_URL || "",
   );
 
@@ -224,8 +224,7 @@ function renderBounceHtml({ apiKey, targetUrl }) {
 }
 
 export const loader = async ({ request }) => {
-  const requestUrl = new URL(request.url);
-  const targetUrl = resolveTargetUrl(requestUrl);
+  const targetUrl = resolveTargetUrl(request);
 
   const headers = new Headers({
     "content-type": "text/html; charset=utf-8",

@@ -18,6 +18,7 @@ import {
 import { getUsageRanges } from "../services/usage.js";
 import { requestGrowthUsageCapIncrease } from "../services/shopifyUsageBilling.js";
 import { syncBillingFromShopify } from "../services/shopifyBillingSync.js";
+import { maybeSyncStoreContext } from "../services/storeContext.js";
 
 const router = express.Router();
 
@@ -31,6 +32,35 @@ function isByonFreeTrialPlan(plan) {
     String(plan?.senderMode || "").trim() === SENDER_MODES.OWN_NUMBER &&
     String(plan?.billingType || "").trim() === PLAN_BILLING_TYPES.FREE_CAP
   );
+}
+
+async function getCurrentGrowthAvailability(shop) {
+  const shopRecord = await Shop.findOne({ shop })
+    .select({ accessToken: 1, storeCountryCode: 1 })
+    .lean();
+
+  // Older installs can predate store-country persistence. Fill that gap at
+  // the moment it matters so an allowed country is not rejected just because
+  // the install record is stale. A temporary Shopify read failure should not
+  // hide an already stored country or the configured default fallback.
+  if (shopRecord && !String(shopRecord.storeCountryCode || "").trim()) {
+    await maybeSyncStoreContext({
+      shop,
+      accessToken: shopRecord.accessToken,
+      force: true,
+    }).catch((error) => {
+      console.warn(
+        "[billing_store_context_sync_failed]",
+        shop,
+        error?.message || error,
+      );
+    });
+  }
+
+  return getGrowthPlanAvailabilityForStore({
+    shop,
+    forceCountryRateRefresh: true,
+  });
 }
 
 async function assertByonOnboardingComplete(shop) {
@@ -125,9 +155,7 @@ router.post("/subscribe", async (req, res) => {
       String(plan?.billingType || "").trim() ===
       PLAN_BILLING_TYPES.SHOPIFY_METERED
     ) {
-      const growthAvailability = await getGrowthPlanAvailabilityForStore({
-        shop,
-      });
+      const growthAvailability = await getCurrentGrowthAvailability(shop);
       if (!growthAvailability.available) {
         return res.status(409).json({
           error: growthAvailability.reason,
@@ -473,9 +501,7 @@ router.post("/validate-change", async (req, res) => {
       String(targetPlan?.billingType || "").trim() ===
       PLAN_BILLING_TYPES.SHOPIFY_METERED
     ) {
-      const growthAvailability = await getGrowthPlanAvailabilityForStore({
-        shop,
-      });
+      const growthAvailability = await getCurrentGrowthAvailability(shop);
       if (!growthAvailability.available) {
         return res.status(409).json({
           error: growthAvailability.reason,

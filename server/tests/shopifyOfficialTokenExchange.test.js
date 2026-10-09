@@ -59,7 +59,7 @@ test("official token exchange parses one complete rotating offline pair", async 
       apiSecretKey: secret,
       scopes: ["read_orders"],
       hostName: "official-exchange.invalid",
-      apiVersion: ApiVersion.October25,
+      apiVersion: ApiVersion.July26,
       isEmbeddedApp: true,
     });
     const { session } = await api.auth.tokenExchange({

@@ -90,6 +90,8 @@ const BillingSchema = new mongoose.Schema(
     usageBalanceUsedCurrencyCode: { type: String, default: null },
     usageChargeLockUntil: { type: Date, default: null },
     usageChargeLockKey: { type: String, default: null },
+    usageBatchLockUntil: { type: Date, default: null },
+    // Legacy lock retained for already-stored documents during rollout.
     pakistanBatchLockUntil: { type: Date, default: null },
     cancelAtPeriodEnd: { type: Boolean, default: false },
     cancelledAt: { type: Date, default: null },
